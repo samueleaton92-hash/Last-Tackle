@@ -218,6 +218,35 @@ textarea, input, select { font-family: inherit; font-size: 16px; }
   border-radius: 2px;
 }
 
+.tabbar {
+  display: flex;
+  gap: 2px;
+  padding: 8px 16px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--line-strong);
+  background: var(--paper);
+}
+.tab-btn {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink);
+  opacity: 0.6;
+  padding: 7px 12px;
+  font-size: 13.5px;
+  font-weight: 600;
+  border-radius: 2px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.tab-btn:hover { opacity: 0.85; }
+.tab-btn.active {
+  opacity: 1;
+  border-color: var(--turf);
+  color: var(--turf);
+}
+:root[data-theme="dark"] .tab-btn.active { border-color: var(--floodlight); color: var(--floodlight); }
+.tab-btn:focus-visible { outline: 2px solid var(--floodlight); outline-offset: 2px; }
+
 .layout {
   flex: 1;
   display: grid;
