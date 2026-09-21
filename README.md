@@ -38,6 +38,18 @@ The split that matters: **the engine owns every number, the AI only narrates.**
 
 This is different from Waybook, where the AI narrated *and* tracked all state via a hidden JSON block. Here state lives in a plain JS object (`player`) and is saved to `localStorage` after every action — the AI has no way to drift the numbers, because it never sees or sets them.
 
+## Recent changes: neglect, tabs, and match ratings
+
+Three problems from early playtesting, fixed:
+
+- **Relationships went static once formed.** A girlfriend acquired in season 1 with no further story beats just sat there forever. Fixed two ways: (1) new partner-specific templates (date night, distance strain, moving in together, a proposal at high relationship value) so the story keeps moving, and (2) a neglect clock — every relationship (girlfriend, coach, teammates, media) quietly decays if you go more than 3 weeks without an event or a proactive action touching it, and a badly neglected relationship can end on its own.
+- **No way to be proactive.** Added tabs — Girlfriend / Team / Coach / Media / Training — reachable any time. Each relationship tab has a once-per-week "spend time" action (static text, no API call) that resets its neglect clock and nudges the relationship up. If you don't have a partner yet, the Girlfriend tab lets you try to meet someone instead of waiting for the random event to fire.
+- **Match ratings were inflated.** The old formula let anyone hit 9-10 almost every match regardless of experience or reputation. Ratings now scale off actual career matches played (a debut player is capped well below a 9) and current skill stats, with variance that narrows as you rack up games — so a rookie's rating swings wildly and low, while a proven veteran's swings narrower and higher.
+
+## Training
+
+The Training tab lets you run one extra session a week (also static, no API call) to nudge Attack, Defense or Kicking up a little — at a small fitness cost — or spend the week on recovery to get fitness back. Training hard on low fitness carries a small chance of a minor niggle. This is deliberately basic; a fuller version would vary gains by position (a fullback training kicking less usefully than a halfback, say) and add diminishing returns as stats approach their cap.
+
 ## What's actually in this prototype
 
 - 6 fictional clubs, 9 positions, 4 starting backgrounds
