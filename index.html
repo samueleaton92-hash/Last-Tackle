@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LAST TACKLE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Anton&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============ SETUP ============ -->
+<main id="setup" class="setup">
+  <div class="setup-wrap">
+
+    <header class="masthead">
+      <h1 class="masthead-title">LAST TACKLE</h1>
+      <p class="masthead-sub">Every career finds its own ending. Write yours.</p>
+    </header>
+
+    <section class="card" id="keyCard">
+      <h2 class="card-title">Anthropic API key</h2>
+      <p class="card-note">Powers every event, commentary line and match recap. Stored only in this browser.</p>
+      <input type="password" id="apiKey" placeholder="sk-ant-..." autocomplete="off">
+      <label class="check">
+        <input type="checkbox" id="rememberKey">
+        Remember this key on this device
+      </label>
+    </section>
+
+    <section class="card" id="resumeCard" hidden>
+      <h2 class="card-title">Continue a career</h2>
+      <div id="resumeSummary" class="resume-summary"></div>
+      <div class="row">
+        <button class="btn btn-primary" id="resumeBtn">Continue career</button>
+        <button class="btn btn-ghost" id="newInsteadBtn">Start a new one instead</button>
+      </div>
+    </section>
+
+    <section class="card" id="createCard">
+      <h2 class="card-title">The team sheet</h2>
+      <p class="card-note">Fill it in. The rest gets written as you go.</p>
+
+      <label class="field">
+        <span>Player name</span>
+        <input type="text" id="pName" placeholder="e.g. Tama Fifita" maxlength="30">
+      </label>
+
+      <label class="field">
+        <span>Position</span>
+        <select id="pPosition"></select>
+      </label>
+
+      <label class="field">
+        <span>Starting club</span>
+        <select id="pClub"></select>
+      </label>
+
+      <label class="field">
+        <span>Age at debut</span>
+        <select id="pAge">
+          <option value="18">18</option>
+          <option value="19" selected>19</option>
+          <option value="20">20</option>
+          <option value="21">21</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span>Background (shapes your first few events)</span>
+        <select id="pBackground">
+          <option value="junior_star">Junior rep star, expected to shine</option>
+          <option value="battler">Battler who fought for this contract</option>
+          <option value="family_club">Following family into the club</option>
+          <option value="import">Moved cities alone to get this shot</option>
+        </select>
+      </label>
+
+      <button class="btn btn-primary btn-full" id="beginBtn">Begin career</button>
+    </section>
+
+    <p class="setup-foot">A fictional competition, fictional clubs. Nothing here is a real player, club or person.</p>
+  </div>
+</main>
+
+<!-- ============ GAME ============ -->
+<div id="game" class="game" hidden>
+
+  <header class="topbar">
+    <div class="topbar-title">LAST TACKLE</div>
+    <div class="topbar-meta" id="topbarMeta">—</div>
+    <button class="sheet-toggle" id="sheetToggle" aria-expanded="false">The Sheet <span id="sheetToggleGlyph">▾</span></button>
+  </header>
+
+  <div class="layout">
+
+    <section class="stage" id="stage" aria-live="polite">
+      <!-- rendered narrative / match content goes here -->
+    </section>
+
+    <aside class="sheet" id="sheet">
+      <div class="sheet-inner" id="sheetInner"></div>
+    </aside>
+
+  </div>
+
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
