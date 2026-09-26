@@ -290,6 +290,119 @@ textarea, input, select { font-family: inherit; font-size: 16px; }
 }
 .narrative p { margin: 0 0 14px; }
 
+.freeform-hint {
+  font-size: 13px;
+  opacity: 0.6;
+  margin: -6px 0 14px;
+}
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.chip {
+  border: 1px solid var(--line-strong);
+  background: var(--paper);
+  color: var(--ink);
+  padding: 7px 12px;
+  font-size: 13px;
+  border-radius: 999px;
+  cursor: pointer;
+  text-align: left;
+}
+.chip:hover { border-color: var(--turf); background: var(--paper-raised); }
+:root[data-theme="dark"] .chip:hover { border-color: var(--floodlight); }
+.chip:focus-visible { outline: 2px solid var(--floodlight); outline-offset: 2px; }
+
+.freeform-box {
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--line-strong);
+  background: var(--paper);
+  color: var(--ink);
+  border-radius: 2px;
+  resize: vertical;
+  margin-bottom: 14px;
+  font-size: 15.5px;
+  line-height: 1.5;
+}
+.freeform-box:focus-visible { outline: 2px solid var(--floodlight); outline-offset: 1px; }
+
+.action-echo {
+  font-size: 14.5px;
+  font-style: italic;
+  opacity: 0.75;
+  padding: 10px 14px;
+  border-left: 2px solid var(--line-strong);
+  margin-bottom: 16px;
+}
+
+.dice-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border: 1px solid var(--line-strong);
+  background: var(--paper);
+  margin-bottom: 18px;
+}
+.dice-detail {
+  font-size: 12.5px;
+  font-family: var(--font-display);
+  letter-spacing: 0.01em;
+  opacity: 0.75;
+}
+
+.dice-roll-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  padding: 44px 0 28px;
+}
+.d20-wrap {
+  position: relative;
+  width: 92px;
+  height: 92px;
+}
+.d20-diamond {
+  position: absolute;
+  inset: 0;
+  background: var(--floodlight);
+  transform: rotate(45deg);
+  border-radius: 16px;
+  transition: background 0.15s ease;
+}
+.d20-wrap.crit-good .d20-diamond { background: var(--turf); }
+.d20-wrap.crit-bad .d20-diamond { background: var(--blood); }
+.d20-face {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-display);
+  font-size: 34px;
+  color: var(--ink);
+}
+.d20-wrap.crit-good .d20-face,
+.d20-wrap.crit-bad .d20-face { color: var(--chalk); }
+.dice-roll-caption {
+  font-size: 14px;
+  font-family: var(--font-display);
+  letter-spacing: 0.01em;
+  opacity: 0.8;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .d20-wrap { animation: dice-settle 0.25s ease-out; }
+}
+@keyframes dice-settle {
+  from { transform: scale(0.85); }
+  to { transform: scale(1); }
+}
+
 .choices {
   display: flex;
   flex-direction: column;
