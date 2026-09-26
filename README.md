@@ -1,10 +1,10 @@
 # LAST TACKLE — prototype
 
-A single-page rugby league career sim. Three files, no build step, runs anywhere static files can be served — same shape as Waybook.
+A single-page rugby league career sim, played like a tabletop RPG scene: you type what you do, the engine rolls dice against your attributes, and the AI narrates the result. Three files, no build step — same shape as Waybook.
 
 ## Run it locally
 
-Just open `index.html` in a browser. No server needed for a first look, though some browsers restrict local file access oddly — if fonts or anything look broken, serve it instead:
+Open `index.html` in a browser. If fonts or anything looks broken, serve it instead:
 
 ```
 cd last-tackle
@@ -13,59 +13,69 @@ python3 -m http.server 8000
 
 Then visit `http://localhost:8000`.
 
-## Deploy to GitHub Pages (same steps as Waybook)
+## Deploy to GitHub Pages
 
-1. Create a new repo (or a folder in an existing one) and upload `index.html`, `style.css`, `app.js`.
+1. Create a repo (or folder in one) and upload `index.html`, `style.css`, `app.js`.
 2. Repo Settings → Pages → set source to the branch/folder you uploaded to.
-3. Your game is live at `https://<username>.github.io/<repo>/`.
+3. Live at `https://<username>.github.io/<repo>/`.
 
 ## What you need to play
 
-An Anthropic API key from [console.anthropic.com](https://console.anthropic.com), with billing/credit set up. The key is entered once on the setup screen and used to call the API directly from your browser — it's stored in `sessionStorage` always, and in `localStorage` too if you tick "remember."
+An Anthropic API key from [console.anthropic.com](https://console.anthropic.com), with billing set up. Entered once on the setup screen, stored in `sessionStorage` (and `localStorage` too if you tick "remember"), used to call the API directly from your browser.
 
-**This means the key is visible to anyone who opens your browser's dev tools or who you share the deployed link with as a live session.** That's fine for solo prototyping. It is *not* fine for a real public release — before anyone else plays this, the API calls need to move behind a backend of your own so your key never reaches a browser. Flagged in the earlier build discussion, still true here.
+**The key is visible to anyone with access to your browser's dev tools or a shared session.** Fine for solo prototyping, not fine for a public release — before anyone else plays this, calls need to move behind a backend so the key never reaches a browser.
+
+## How it plays
+
+Every event gives you a situation and asks what you do — there are no multiple-choice buttons. You type your own action (or tap a suggestion chip to fill the box, then edit it if you like) and hit the button to resolve it.
+
+Two kinds of events:
+
+- **Checks** — situations with a real uncertain outcome (handling a media scandal, smoothing over a fight with a teammate, showing up for a date night). Your text is read for which of six attributes it's testing — **Power, Steel, Boot, Fitness, Charisma, Composure** — and how boldly you're playing it. The engine rolls a d20, adds your attribute's modifier, checks it against the difficulty, and the result lands in one of four tiers: critical success, success, fail, or critical failure. Playing it **bold** raises the difficulty but a success jumps straight to the best tier; playing it **cautious** lowers the difficulty but caps how good or bad the result can be.
+- **Choices** — situations that are a decision, not a skill attempt (signing with a rival club, accepting a proposal, calling time on your career). Your text is matched to one of two or three fixed outcomes. No dice — you don't roll to find out who you propose to.
 
 ## How the game is built
 
-The split that matters: **the engine owns every number, the AI only narrates.**
+The rule that matters: **the engine owns every number, including the dice roll. The AI only narrates what the engine already decided.**
 
-- `app.js` holds the entire simulation: player stats, club data, event templates with fixed triggers/effects/choices, and a deterministic match simulator. None of that touches the API.
-- The AI is called in exactly two places:
-  1. **Event narration** — given a fixed "beat" (a plain-English situation the engine already decided, e.g. "a rival club has offered $X"), the AI writes 2-4 sentences of flavor text. It never decides what happens next; the choices and their effects are hard-coded in the template.
-  2. **Match commentary + recap** — given the final score, key moment types and minutes (all computed in JS), the AI writes broadcast-style lines and a short recap. It's told explicitly not to invent a different result.
-- Choice **outcomes** (the short text after you pick an option) are hand-written per choice, not AI-generated — this keeps the common path cheap and fast, and reserves the AI call for the one moment per event that benefits most from unique phrasing (see the "cache aggressively" note from the design discussion).
-- Recovery-week text (injury sidelined) cycles through a small static pool — no API call at all. Same reasoning.
+Concretely, when you submit a free-text action:
 
-This is different from Waybook, where the AI narrated *and* tracked all state via a hidden JSON block. Here state lives in a plain JS object (`player`) and is saved to `localStorage` after every action — the AI has no way to drift the numbers, because it never sees or sets them.
+1. **Skill classification** (checks only) — the engine keyword-matches your text against the attributes a "sensible" reading of the situation could test, and picks one. Plain JavaScript, instant, no API call.
+2. **Boldness classification** — same idea, keyword-matched to cautious / standard / bold. Also no API call.
+3. **The roll** — a real d20 + your attribute's modifier vs. the event's difficulty, computed in JS and shown as a short rolling-die animation before the result lands (skipped instantly if the browser's reduced-motion setting is on).
+4. **Effects applied** — each template has hand-written, deterministic effects for each of the four result tiers (or each branch, for choice-mode events). The roll (or branch match) decides which set applies; nothing here is AI-generated.
+5. **Narration** — only now does the AI get called, and only to describe in 2-4 sentences what already happened, weaving in your own wording. It's explicitly told the outcome is fixed and it must not contradict it.
 
-## Recent changes: neglect, tabs, and match ratings
+Match days work the same way they always have: the engine computes score, key moments and injury risk from your stats, form and experience; the AI narrates the commentary and recap afterward, told not to invent a different result.
 
-Three problems from early playtesting, fixed:
+The proactive tabs — Girlfriend / Team / Coach / Media / Training — stay static (a small hand-written line pool, no API call), since they're meant to be used every week without adding cost or latency.
 
-- **Relationships went static once formed.** A girlfriend acquired in season 1 with no further story beats just sat there forever. Fixed two ways: (1) new partner-specific templates (date night, distance strain, moving in together, a proposal at high relationship value) so the story keeps moving, and (2) a neglect clock — every relationship (girlfriend, coach, teammates, media) quietly decays if you go more than 3 weeks without an event or a proactive action touching it, and a badly neglected relationship can end on its own.
-- **No way to be proactive.** Added tabs — Girlfriend / Team / Coach / Media / Training — reachable any time. Each relationship tab has a once-per-week "spend time" action (static text, no API call) that resets its neglect clock and nudges the relationship up. If you don't have a partner yet, the Girlfriend tab lets you try to meet someone instead of waiting for the random event to fire.
-- **Match ratings were inflated.** The old formula let anyone hit 9-10 almost every match regardless of experience or reputation. Ratings now scale off actual career matches played (a debut player is capped well below a 9) and current skill stats, with variance that narrows as you rack up games — so a rookie's rating swings wildly and low, while a proven veteran's swings narrower and higher.
+### Why keyword-matching instead of asking the AI to classify
 
-## Training
+It would be easy to have the AI read your free text and decide which attribute to test or which branch you meant — LLMs are much better at that kind of fuzzy judgment than a keyword list. That was deliberately avoided anyway: the entire point of "the engine owns the numbers" is that nothing which can be reasoned or argued with gets to decide whether you succeed. A keyword classifier is dumber, but it's inspectable and can't be talked into a favorable ruling by clever phrasing.
 
-The Training tab lets you run one extra session a week (also static, no API call) to nudge Attack, Defense or Kicking up a little — at a small fitness cost — or spend the week on recovery to get fitness back. Training hard on low fitness carries a small chance of a minor niggle. This is deliberately basic; a fuller version would vary gains by position (a fullback training kicking less usefully than a halfback, say) and add diminishing returns as stats approach their cap.
+The real cost of that choice: type something the keyword lists don't recognize and you'll silently get the template's default skill or branch rather than what you actually meant. The suggestion chips exist mostly to paper over this — they're phrased to hit the keyword lists reliably, so a player who doesn't want to think about exact wording can tap one. The keyword lists themselves live near the top of `app.js` (`SKILL_KEYWORDS`, `BOLD_WORDS`, `CAUTIOUS_WORDS`, and each template's `matchWords`) and are easy to extend if you find your own phrasing keeps missing.
 
-## What's actually in this prototype
+### Cost note
 
-- 6 fictional clubs, 9 positions, 4 starting backgrounds
-- 13 event templates across career / finance / nightlife / reputation / relationships, each with 2-3 choices and real (if simple) trade-offs
-- A deterministic match simulator: your stats + form + a rival-round bonus + randomness → score, player rating, injury risk
+Each event now costs two AI calls (opening narration + outcome narration) instead of one, since the outcome text is no longer pre-written per choice — it has to reflect whatever you actually typed. Still short, cheap calls; a full 18-round season is on the order of 25-35 calls total.
+
+## What's in this prototype
+
+- Six attributes (Power, Steel, Boot, Fitness, Charisma, Composure), 6 fictional clubs, 9 positions, 4 starting backgrounds
+- 7 dice-check events and 10 decision events, covering career, finance, nightlife, reputation and relationships
+- A deterministic match simulator: your stats + form + experience + a rival-round bonus + randomness → score, player rating (properly bounded — a debut player can't post a 9 or 10 no matter how lucky the roll), and injury risk
+- A relationship neglect system: girlfriend, coach, teammates and media all quietly decay if you go 3+ weeks without an event or proactive action touching them; a badly neglected relationship can end on its own
+- Proactive tabs (Girlfriend / Team / Coach / Media / Training) for once-a-week actions outside the random event roll
 - An 18-round season, off-season contract step, aging, retirement (chosen or forced at 37)
 - Autosave to `localStorage`, resume-on-load, "abandon career" reset
 
 ## Where it's deliberately thin (extension points)
 
-- **13 templates, not 30-50.** Easy to add more — copy the shape of any existing template in `EVENT_TEMPLATES` in `app.js`. Each needs a `weight(p)` eligibility function, a `beat(p)` situation, and 2-3 `choices` with `effects` and `outcome`.
-- **One competition, 6 clubs, no ladder/finals logic.** The season currently doesn't track other clubs' results or a competition table — every match is simulated in isolation against a semi-random opponent. A ladder would be a good next system to build, still entirely in JS, no AI needed.
-- **No consolidated long-term memory of specific events.** The visible log keeps your last few entries; older ones just roll off. If you want the AI to occasionally reference something from three seasons ago, you'd want a short rolling summary (built the same way Waybook's history consolidation worked), regenerated every N rounds via one more API call.
-- **No art.** Portraits/club crests would come from a separate, offline image-generation pass — not runtime calls — per the earlier discussion on cost and consistency.
+- **17 templates, not 30-50.** Add more by copying the shape of an existing entry in `EVENT_TEMPLATES` — decide `mode: 'check'` (needs `primarySkills`, `baseDC`, `outcomeTable`) or `mode: 'choice'` (needs `branches`).
+- **Keyword lists are hand-tuned, not exhaustive.** If players keep getting misclassified into the wrong skill or branch, that's the first place to look — either widen `SKILL_KEYWORDS`/`matchWords`, or accept it as a deliberate trade-off (see above).
+- **Match day has no free-text/dice layer.** Only events do. Could be added (a pre-match "how are you approaching this one?" prompt feeding into the match simulator's variance) but wasn't, to avoid adding an extra step before every single match in an 18-round season.
+- **One competition, 6 clubs, no ladder/finals logic.** Every match is simulated in isolation against a semi-random opponent.
+- **No consolidated long-term memory of specific events.** The visible log keeps your last few entries; older ones roll off.
+- **No art.** Would come from a separate, offline image-generation pass — not runtime calls.
 - **Single save slot, single device.** No accounts, no cloud sync.
-
-## Cost note
-
-Two API calls per event/match at most (one narration call), each capped at a few hundred tokens. A full season (18 rounds, roughly 40% of which are events rather than matches) is on the order of 20-25 calls. Cheap to iterate on, but keep an eye on usage if you're testing repeatedly.
