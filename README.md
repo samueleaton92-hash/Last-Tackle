@@ -1,4 +1,4 @@
-# LAST TACKLE — prototype
+ # LAST TACKLE — prototype
 
 A single-page rugby league career sim, played like a tabletop RPG scene: you type what you do, the engine rolls dice against your attributes, and the AI narrates the result. Three files, no build step — same shape as Waybook.
 
@@ -34,6 +34,12 @@ Two kinds of events:
 - **Checks** — situations with a real uncertain outcome (handling a media scandal, smoothing over a fight with a teammate, showing up for a date night). Your text is read for which of six attributes it's testing — **Power, Steel, Boot, Fitness, Charisma, Composure** — and how boldly you're playing it. The engine rolls a d20, adds your attribute's modifier, checks it against the difficulty, and the result lands in one of four tiers: critical success, success, fail, or critical failure. Playing it **bold** raises the difficulty but a success jumps straight to the best tier; playing it **cautious** lowers the difficulty but caps how good or bad the result can be.
 - **Choices** — situations that are a decision, not a skill attempt (signing with a rival club, accepting a proposal, calling time on your career). Your text is matched to one of two or three fixed outcomes. No dice — you don't roll to find out who you propose to.
 
+### Match day
+
+Before kickoff you get one tap: **Cautious / Balanced / All out.** This widens or narrows the same variance that decides your match rating and score — bold play can produce a much better or much worse performance than balanced, cautious play is steadier but caps both ends. No typing required for this part; it's meant to happen every match without adding friction across an 18-round season.
+
+On roughly 45% of matches, a genuine **crunch moment** fires mid-game — a last-ditch tackle to save a try, a kick to win it at the death, a rival trying to needle you into a reaction — picked based on the match state that's already been simulated (a kicking chance for a close margin, a niggle template on rivalry rounds, and so on). You type what you do, it's resolved with the same dice-check machinery as an event, and the result adjusts the actual score and your match rating before the game is finalized — a genuine success there can flip a loss into a win. It costs no extra API call: the same single narration call that writes the commentary and recap is simply given the crunch moment's result and told to make clear that specific moment, and your stated action in it, is what swung the game.
+
 ## How the game is built
 
 The rule that matters: **the engine owns every number, including the dice roll. The AI only narrates what the engine already decided.**
@@ -43,10 +49,10 @@ Concretely, when you submit a free-text action:
 1. **Skill classification** (checks only) — the engine keyword-matches your text against the attributes a "sensible" reading of the situation could test, and picks one. Plain JavaScript, instant, no API call.
 2. **Boldness classification** — same idea, keyword-matched to cautious / standard / bold. Also no API call.
 3. **The roll** — a real d20 + your attribute's modifier vs. the event's difficulty, computed in JS and shown as a short rolling-die animation before the result lands (skipped instantly if the browser's reduced-motion setting is on).
-4. **Effects applied** — each template has hand-written, deterministic effects for each of the four result tiers (or each branch, for choice-mode events). The roll (or branch match) decides which set applies; nothing here is AI-generated.
+4. **Effects applied** — each template has hand-written, deterministic effects for each of the four result tiers (or each branch, for choice-mode events; or a score/rating delta, for match crunch moments). The roll (or branch match) decides which set applies; nothing here is AI-generated.
 5. **Narration** — only now does the AI get called, and only to describe in 2-4 sentences what already happened, weaving in your own wording. It's explicitly told the outcome is fixed and it must not contradict it.
 
-Match days work the same way they always have: the engine computes score, key moments and injury risk from your stats, form and experience; the AI narrates the commentary and recap afterward, told not to invent a different result.
+Match days work almost the same way: the engine computes a base score, key moments and injury risk from your stats, form, experience and chosen boldness; if a crunch moment fires, that's resolved with a real dice check exactly like an event, and its score/rating delta is applied on top of the base result — then the AI narrates the whole thing once, told not to invent a different final score.
 
 The proactive tabs — Girlfriend / Team / Coach / Media / Training — stay static (a small hand-written line pool, no API call), since they're meant to be used every week without adding cost or latency.
 
@@ -74,7 +80,7 @@ Each event now costs two AI calls (opening narration + outcome narration) instea
 
 - **17 templates, not 30-50.** Add more by copying the shape of an existing entry in `EVENT_TEMPLATES` — decide `mode: 'check'` (needs `primarySkills`, `baseDC`, `outcomeTable`) or `mode: 'choice'` (needs `branches`).
 - **Keyword lists are hand-tuned, not exhaustive.** If players keep getting misclassified into the wrong skill or branch, that's the first place to look — either widen `SKILL_KEYWORDS`/`matchWords`, or accept it as a deliberate trade-off (see above).
-- **Match day has no free-text/dice layer.** Only events do. Could be added (a pre-match "how are you approaching this one?" prompt feeding into the match simulator's variance) but wasn't, to avoid adding an extra step before every single match in an 18-round season.
+- **4 crunch-moment templates, not a dozen.** Add more by copying the shape of an entry in `MATCH_MOMENTS` — needs `side` ('own' or 'opp'), `weight(base, player)`, `primarySkills`, `baseDC`, and an `outcomeTable`.
 - **One competition, 6 clubs, no ladder/finals logic.** Every match is simulated in isolation against a semi-random opponent.
 - **No consolidated long-term memory of specific events.** The visible log keeps your last few entries; older ones roll off.
 - **No art.** Would come from a separate, offline image-generation pass — not runtime calls.
