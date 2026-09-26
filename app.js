@@ -1,14 +1,18 @@
 // ============================================================
 // LAST TACKLE — prototype
-// Engine owns every number. The AI only narrates what the engine
-// has already decided. See README for the split.
+// Engine owns every number, including the dice. The player types
+// what they do; the engine deterministically picks which attribute
+// is being tested and how bold the approach is, rolls a d20 against
+// it, and only THEN asks the AI to narrate what already happened.
+// See README for the full split.
 // ============================================================
 
 const MODEL = 'claude-sonnet-4-6';
-const SAVE_KEY = 'lastTackle.save.v1';
+const SAVE_KEY = 'lastTackle.save.v2';
 const KEY_STORAGE = 'lastTackle.apiKey';
 const ROUNDS_PER_SEASON = 18;
 const EVENT_CHANCE = 0.4;
+const NEGLECT_THRESHOLD = 3; // weeks of silence before a relationship starts to slide
 
 // ---------- Static data ----------
 
@@ -28,28 +32,34 @@ const CLUBS = [
 
 const RIVALS = { storm: 'harbour', harbour: 'storm', westside: 'valley', valley: 'westside', ironbark: 'coast', coast: 'ironbark' };
 
+// Six D&D-style attributes. Power/Steel/Boot/Fitness are physical,
+// Charisma/Composure are social and mental — free-text actions need
+// both, since not every scene on this game is decided on the field.
+const ATTRS = ['power', 'steel', 'boot', 'fitness', 'charisma', 'composure'];
+const ATTR_LABELS = { power: 'Power', steel: 'Steel', boot: 'Boot', fitness: 'Fitness', charisma: 'Charisma', composure: 'Composure' };
+
 const BACKGROUNDS = {
   junior_star: {
     label: 'Junior rep star, expected to shine',
-    statBonus: { attack: 6, defense: 2, kicking: 2, fitness: 0 },
+    statBonus: { power: 6, steel: 2, boot: 2, fitness: 0, charisma: 4, composure: -2 },
     repStart: 35,
     intro: 'the rep-team hype that followed you into first grade'
   },
   battler: {
     label: 'Battler who fought for this contract',
-    statBonus: { attack: 0, defense: 4, kicking: 0, fitness: 6 },
+    statBonus: { power: 0, steel: 4, boot: 0, fitness: 6, charisma: 0, composure: 6 },
     repStart: 10,
     intro: 'the long, unglamorous road here — trials, cuts, one last shot that finally landed'
   },
   family_club: {
     label: 'Following family into the club',
-    statBonus: { attack: 2, defense: 2, kicking: 2, fitness: 2 },
+    statBonus: { power: 2, steel: 2, boot: 2, fitness: 2, charisma: 2, composure: 2 },
     repStart: 25,
     intro: 'a family name the fans already know, for better or worse'
   },
   import: {
     label: 'Moved cities alone to get this shot',
-    statBonus: { attack: 4, defense: 4, kicking: 0, fitness: 2 },
+    statBonus: { power: 4, steel: 4, boot: 0, fitness: 2, charisma: -2, composure: 0 },
     repStart: 18,
     intro: 'a city with no one in it you know yet'
   }
@@ -65,411 +75,394 @@ function weightedPick(items) {
 }
 function clubName(id) { return (CLUBS.find(c => c.id === id) || {}).name || id; }
 
+// ---------- Dice & free-text classification (all deterministic JS — ----------
+// ---------- the AI never touches the roll or the classification)    ----------
+
+function modifier(statValue) { return Math.round((statValue - 50) / 10); } // ~ -4..+5
+
+function rollCheck(statValue, baseDC, boldness) {
+  const dc = baseDC + (boldness === 'cautious' ? -2 : boldness === 'bold' ? 3 : 0);
+  const d20 = 1 + Math.floor(Math.random() * 20);
+  const mod = modifier(statValue);
+  const total = d20 + mod;
+  let degree;
+  if (d20 === 20) degree = 'critSuccess';
+  else if (d20 === 1) degree = 'critFail';
+  else if (boldness === 'cautious') degree = total >= dc ? 'success' : 'fail';
+  else if (boldness === 'bold') degree = total >= dc ? 'critSuccess' : 'critFail';
+  else {
+    if (total >= dc + 8) degree = 'critSuccess';
+    else if (total >= dc) degree = 'success';
+    else if (total >= dc - 8) degree = 'fail';
+    else degree = 'critFail';
+  }
+  return { d20, mod, total, dc, boldness, degree };
+}
+
+const SKILL_KEYWORDS = {
+  charisma: ['talk', 'charm', 'joke', 'laugh', 'explain', 'persuade', 'chat', 'smile', 'compliment', 'apolog', 'win them over', 'disarm', 'flirt'],
+  composure: ['calm', 'breathe', 'focus', 'ignore', 'hold', 'patient', 'quiet', 'steady', 'professional', 'walk away', 'let it go', 'block it out', 'block out'],
+  power: ['push', 'aggress', 'confront', 'shove', 'force', 'go hard', 'physical'],
+  steel: ['stand my ground', 'stand ground', 'defend', 'brace', 'hold firm', 'stay strong', 'firm', 'tough it out'],
+  boot: ['kick', 'boot'],
+  fitness: ['run', 'train', 'grind', 'push through', 'work harder', 'extra session']
+};
+
+function classifySkill(text, allowedSkills) {
+  const lower = text.toLowerCase();
+  for (const skill of allowedSkills) {
+    const kws = SKILL_KEYWORDS[skill] || [];
+    if (kws.some(k => lower.includes(k))) return skill;
+  }
+  return allowedSkills[0];
+}
+
+const BOLD_WORDS = ['all in', 'go big', 'risk it', 'all out', 'no matter what', 'everything', 'full send', 'go for it', 'balls to the wall', 'all-in'];
+const CAUTIOUS_WORDS = ['carefully', 'quietly', 'small', 'safe', 'a little', 'gently', 'low-key', 'just a', 'play it safe', 'cautious'];
+
+function classifyBoldness(text) {
+  const lower = text.toLowerCase();
+  if (BOLD_WORDS.some(w => lower.includes(w))) return 'bold';
+  if (CAUTIOUS_WORDS.some(w => lower.includes(w))) return 'cautious';
+  return 'standard';
+}
+
+function classifyBranch(text, branches) {
+  const lower = text.toLowerCase();
+  for (const b of branches) {
+    if (b.matchWords.some(w => lower.includes(w))) return b;
+  }
+  return branches.find(b => b.default) || branches[0];
+}
+
 // ---------- Event templates ----------
-// trigger(p): boolean eligibility. weight(p): relative pick chance.
-// choices: { id, label, effects(p) -> mutates p, outcome(p, vars) -> string }
-// beat(p): short fixed description of the situation fed to the AI as the "beat" —
-// the AI narrates this beat, it never invents what happens.
+// mode: 'check' — free text is classified into one of primarySkills, a
+//   boldness, then resolved with a real dice roll against outcomeTable.
+// mode: 'choice' — free text is classified into one of a few fixed
+//   branches (a decision, not a skill attempt) — no roll, no chance
+//   involved, just "which way did you go."
+// Every outcomeTable/branch entry sets effects(p, vars) — deterministic —
+// and a hint — a plain-English fact the AI is given to narrate, never to
+// invent or contradict.
 
 const EVENT_TEMPLATES = [
+  // ---------------- CHECK (dice) events ----------------
+  {
+    id: 'coach_tactical_clash',
+    category: 'Career',
+    mode: 'check',
+    touches: ['coach'],
+    weight: (p) => p.relationships.coach < 25 ? 10 : 4,
+    primarySkills: ['composure', 'steel'],
+    baseDC: 13,
+    beat: () => ({ text: `The coach pulls you aside after review. He wants you playing a tighter, more structured role — less of the ad-lib you've built your name on. What do you say to him?` }),
+    suggestions: ['I push back and tell him I play better my own way', 'I hear him out and agree to tighten up', 'I try to find a middle ground with him'],
+    outcomeTable: {
+      critSuccess: { effects: (p) => { p.relationships.coach += 20; p.form += 10; p.reputation += 2; }, hint: 'You make your case so convincingly he not only backs off, he sounds a little impressed.' },
+      success:     { effects: (p) => { p.relationships.coach += 8; p.form += 3; }, hint: `You hold a reasonable middle ground. Nobody's fully happy, but nobody's fully unhappy either.` },
+      fail:        { effects: (p) => { p.relationships.coach -= 10; p.form -= 5; }, hint: 'It comes out clumsier than you meant. He hears defiance where you meant confidence.' },
+      critFail:    { effects: (p) => { p.relationships.coach -= 20; p.form -= 8; p.reputation -= 2; }, hint: 'It turns into a real argument. Word of it reaches the rest of the sheds by afternoon training.' }
+    }
+  },
+  {
+    id: 'night_out_before_match',
+    category: 'Nightlife',
+    mode: 'check',
+    touches: ['teammates'],
+    weight: () => 7,
+    primarySkills: ['composure', 'fitness'],
+    baseDC: 12,
+    beat: () => ({ text: `Thursday night, a few of the boys are heading out. Captain's run is 9am tomorrow, then a match Saturday. What's your move?` }),
+    suggestions: ['I go big and worry about tomorrow later', 'I go for one or two, nothing crazy', 'I stay home and protect the week'],
+    outcomeTable: {
+      critSuccess: { effects: (p) => { p.relationships.teammates += 12; p.form += 4; }, hint: 'You strike the balance perfectly — good time, no damage, the boys respect it.' },
+      success:     { effects: (p) => { p.relationships.teammates += 6; p.form += 1; }, hint: `A solid, unremarkable night. You're there, you're sharp enough for the run.` },
+      fail:        { effects: (p) => { p.form -= 8; p.relationships.coach -= 4; }, hint: `It runs later than planned. The captain's run the next morning is not kind to you.` },
+      critFail:    { effects: (p) => { p.form -= 15; p.stats.fitness -= 4; p.relationships.coach -= 8; }, hint: `It's a big one, bigger than intended. You're a passenger at training and everyone can tell.` }
+    }
+  },
+  {
+    id: 'media_scandal',
+    category: 'Reputation',
+    mode: 'check',
+    touches: ['media'],
+    weight: (p) => p.relationships.media < 0 ? 9 : 2,
+    primarySkills: ['charisma', 'composure'],
+    baseDC: 14,
+    beat: () => ({ text: `A tabloid has run a story built on a half-true version of your night out last week, sourced from "a club insider." How do you handle it?` }),
+    suggestions: ['I put out a sharp, honest statement myself', 'I say absolutely nothing and let it blow over', `I let the club's media team handle it`],
+    outcomeTable: {
+      critSuccess: { effects: (p) => { p.relationships.media += 15; p.reputation += 5; }, hint: 'Your response is measured and disarming. It ends the story instead of feeding it.' },
+      success:     { effects: (p) => { p.relationships.media += 5; }, hint: 'It\'s handled adequately. The story fades out over a few days, the way most of these do.' },
+      fail:        { effects: (p) => { p.relationships.media -= 10; p.reputation -= 3; }, hint: 'It comes across defensive. The story gets a second life instead of dying quietly.' },
+      critFail:    { effects: (p) => { p.relationships.media -= 20; p.reputation -= 6; p.relationships.teammates -= 5; }, hint: 'It backfires badly — a line gets clipped out of context and goes everywhere.' }
+    }
+  },
+  {
+    id: 'teammate_conflict',
+    category: 'Relationships',
+    mode: 'check',
+    touches: ['teammates'],
+    weight: (p) => p.relationships.teammates < 0 ? 10 : 3,
+    primarySkills: ['composure', 'steel'],
+    baseDC: 12,
+    beat: () => ({ text: `Words in the sheds after a loss. A senior teammate says, loudly, that your positioning cost the team the game. What do you do?` }),
+    suggestions: ['I confront him about it directly', 'I let it go and prove it on the field instead', 'I try to defuse it with a joke'],
+    outcomeTable: {
+      critSuccess: { effects: (p) => { p.relationships.teammates += 15; p.form += 5; }, hint: 'You handle it with a mix of steel and grace that actually earns his respect.' },
+      success:     { effects: (p) => { p.relationships.teammates += 5; }, hint: `It's tense but you get through it without it becoming a bigger issue.` },
+      fail:        { effects: (p) => { p.relationships.teammates -= 8; p.form -= 3; }, hint: 'It escalates further than it needed to before someone steps between you.' },
+      critFail:    { effects: (p) => { p.relationships.teammates -= 18; p.relationships.coach -= 5; }, hint: `It turns into a proper blow-up. The coach hears about it before you've even showered.` }
+    }
+  },
+  {
+    id: 'partner_date_night',
+    category: 'Relationships',
+    mode: 'check',
+    touches: ['partner'],
+    weight: (p) => (p.partner ? 10 : 0),
+    primarySkills: ['charisma', 'composure'],
+    baseDC: 11,
+    beat: (p) => ({ text: `${p.partner.name} books a table somewhere neither of you have been, no real occasion, just a night you're both free. How do you show up for it?` }),
+    suggestions: ['I put my phone away completely and focus on them', `I go, but I'll probably check the group chat`, 'I try to make it a really big, memorable night'],
+    outcomeTable: {
+      critSuccess: { effects: (p) => { p.partner.value += 18; p.form += 4; }, hint: `It's one of the best nights you've had in ages, and it isn't close.` },
+      success:     { effects: (p) => { p.partner.value += 8; }, hint: 'A good, simple night together. Nothing dramatic, just present.' },
+      fail:        { effects: (p) => { p.partner.value -= 6; }, hint: `You're there, but you're not really there, and they notice.` },
+      critFail:    { effects: (p) => { p.partner.value -= 14; p.form -= 3; }, hint: 'The phone checks turn into a real argument halfway through dinner.' }
+    }
+  },
+  {
+    id: 'partner_distance_strain',
+    category: 'Relationships',
+    mode: 'check',
+    touches: ['partner'],
+    weight: (p) => (p.partner && p.partner.value < 25 ? 11 : 3),
+    primarySkills: ['composure', 'charisma'],
+    baseDC: 13,
+    beat: (p) => ({ text: `Training, recovery, review, repeat — ${p.partner.name} points out you've eaten dinner together twice this month. What do you say?` }),
+    suggestions: ['I clear proper time for us this week, no excuses', 'I explain honestly how demanding the season is right now', `I promise it'll ease up after finals`],
+    outcomeTable: {
+      critSuccess: { effects: (p) => { p.partner.value += 20; }, hint: `You actually follow through, and it's exactly what was needed.` },
+      success:     { effects: (p) => { p.partner.value += 8; }, hint: 'It\'s a fair conversation. Things ease, a little.' },
+      fail:        { effects: (p) => { p.partner.value -= 8; }, hint: `It's the same conversation you've half-had before. Nothing really changes.` },
+      critFail:    { effects: (p) => { p.partner.value -= 18; }, hint: `It lands badly. The promise sounds hollow even as you're saying it.` }
+    }
+  },
+  {
+    id: 'family_pressure',
+    category: 'Relationships',
+    mode: 'check',
+    touches: [],
+    weight: (p) => (p.background === 'family_club' ? 8 : 3),
+    primarySkills: ['composure'],
+    baseDC: 12,
+    beat: () => ({ text: `Family turns up in numbers to the next home game — the kind of crowd that expects a performance to match the name on your jersey. How do you carry that?` }),
+    suggestions: ['I embrace it and play for the name', 'I block it out and just play my own game', `I try not to think about it at all`],
+    outcomeTable: {
+      critSuccess: { effects: (p) => { p.form += 10; p.reputation += 4; }, hint: `You feed off it completely. It's one of those days everything just clicks.` },
+      success:     { effects: (p) => { p.form += 4; }, hint: 'A solid, professional performance. You get through it fine.' },
+      fail:        { effects: (p) => { p.form -= 4; }, hint: `The weight of it gets into your head more than you'd like to admit.` },
+      critFail:    { effects: (p) => { p.form -= 10; p.reputation -= 2; }, hint: `It visibly rattles you. Not your day, and everyone in the stand can see why.` }
+    }
+  },
+
+  // ---------------- CHOICE (decision, no roll) events ----------------
   {
     id: 'contract_offer_rival',
     category: 'Career',
+    mode: 'choice',
+    touches: ['coach'],
     weight: (p) => (p.contractYearsLeft <= 1 && p.age >= 20) ? 14 : 0,
     beat: (p) => {
       const rivalPool = CLUBS.filter(c => c.id !== p.club);
       const rival = pick(rivalPool);
       const offer = Math.round(p.salary * (1 + Math.random() * 0.5 + 0.1));
-      return { rival, offer, text: `${rival.name} have approached your management with a ${p.contractYearsLeft + 1}-year offer worth $${offer.toLocaleString()} a season, well above what ${clubName(p.club)} are paying you now.` };
+      return { rival, offer, text: `${rival.name} have approached your management with a ${p.contractYearsLeft + 1}-year offer worth $${offer.toLocaleString()} a season, well above what ${clubName(p.club)} are paying you now. What do you do?` };
     },
-    choices: [
+    suggestions: ['Sign with the rivals', 'Stay loyal to my club', 'Use it to renegotiate here'],
+    branches: [
       {
-        id: 'accept',
-        label: 'Sign with the rivals',
-        effects: (p, v) => {
-          p.relationships.teammates -= 15; p.relationships.coach -= 25;
-          p.club = v.rival.id; p.salary = v.offer; p.contractYearsLeft = 3; p.reputation += 4;
-        },
-        outcome: (p, v) => `You sign. ${clubName(v.rival.id)} announce it within the hour — and your old dressing room finds out from the same press release you did.`
+        id: 'accept', matchWords: ['sign', 'accept', 'go', 'leave', 'join', 'rivals'],
+        effects: (p, v) => { p.relationships.teammates -= 15; p.relationships.coach -= 25; p.club = v.rival.id; p.salary = v.offer; p.contractYearsLeft = 3; p.reputation += 4; },
+        hint: (v) => `You sign. ${v.rival.name} announce it within the hour — and your old dressing room finds out from the same press release you did.`
       },
       {
-        id: 'decline',
-        label: 'Stay loyal to your club',
+        id: 'decline', matchWords: ['stay', 'loyal', 'decline', 'remain', 'no'], default: true,
         effects: (p) => { p.relationships.teammates += 10; p.relationships.coach += 15; p.reputation += 2; p.contractYearsLeft = 2; },
-        outcome: () => `You knock it back without much fanfare. The club never officially thanks you for it, but the coach starts talking to you differently.`
+        hint: () => `You knock it back without much fanfare. The club never officially thanks you for it, but the coach starts talking to you differently.`
       },
       {
-        id: 'leverage',
-        label: 'Use it to renegotiate where you are',
-        effects: (p, v) => { p.relationships.coach -= 10; p.salary = Math.round(p.salary * 1.2); p.contractYearsLeft = 2; p.flags.usedLeverage = true; },
-        outcome: () => `Management matches most of it to keep you. The coach signs off on the numbers but doesn't love how you got there.`
-      }
-    ]
-  },
-  {
-    id: 'coach_tactical_clash',
-    category: 'Career',
-    touches: ['coach'],
-    weight: (p) => p.relationships.coach < 25 ? 10 : 4,
-    beat: (p) => ({ text: `The coach pulls you aside after review. He wants you playing a tighter, more structured role — less of the ad-lib you've built your name on.` }),
-    choices: [
-      {
-        id: 'comply',
-        label: 'Play it his way',
-        effects: (p) => { p.relationships.coach += 15; p.stats.defense += 3; p.form -= 5; },
-        outcome: () => `You rein it in. The coach is happy. Something in your game feels smaller for a few weeks.`
-      },
-      {
-        id: 'push_back',
-        label: 'Push back and keep playing your way',
-        effects: (p) => { p.relationships.coach -= 15; p.form += 8; p.reputation += 3; },
-        outcome: () => `You hold your ground. It's tense in the video session, but you back yourself, and it shows on the field.`
-      },
-      {
-        id: 'compromise',
-        label: 'Find a middle ground with him',
-        effects: (p) => { p.relationships.coach += 5; p.stats.attack += 1; p.stats.defense += 1; },
-        outcome: () => `You meet him partway. Not everyone's fully satisfied, but nobody's fully unhappy either.`
+        id: 'leverage', matchWords: ['leverage', 'renegotiate', 'use it', 'more money', 'push for'],
+        effects: (p) => { p.relationships.coach -= 10; p.salary = Math.round(p.salary * 1.2); p.contractYearsLeft = 2; p.flags.usedLeverage = true; },
+        hint: () => `Management matches most of it to keep you. The coach signs off on the numbers but doesn't love how you got there.`
       }
     ]
   },
   {
     id: 'captaincy_offer',
     category: 'Career',
+    mode: 'choice',
     touches: ['coach'],
     weight: (p) => (p.reputation >= 55 && p.age >= 24 && !p.flags.isCaptain) ? 9 : 0,
-    beat: (p) => ({ text: `With the leadership group thin this year, the coach floats the idea of handing you the captaincy.` }),
-    choices: [
-      {
-        id: 'accept_captaincy',
-        label: 'Accept the armband',
+    beat: () => ({ text: `With the leadership group thin this year, the coach floats the idea of handing you the captaincy. What do you tell him?` }),
+    suggestions: ['I accept the armband', `I'm not ready for that kind of scrutiny`],
+    branches: [
+      { id: 'accept', matchWords: ['yes', 'accept', 'take it', 'armband', 'honoured', 'honored'], default: true,
         effects: (p) => { p.flags.isCaptain = true; p.reputation += 10; p.relationships.media += 10; p.salary = Math.round(p.salary * 1.1); },
-        outcome: () => `You take it. The number on your jersey doesn't change, but everything else around you does.`
-      },
-      {
-        id: 'decline_captaincy',
-        label: 'Decline — not ready for the scrutiny',
+        hint: () => `You take it. The number on your jersey doesn't change, but everything else around you does.` },
+      { id: 'decline', matchWords: ['no', 'decline', 'not ready', 'pass'],
         effects: (p) => { p.form += 5; p.relationships.coach -= 5; },
-        outcome: () => `You turn it down. The coach respects the honesty, even if he'd hoped for a different answer.`
-      }
+        hint: () => `You turn it down. The coach respects the honesty, even if he'd hoped for a different answer.` }
     ]
   },
   {
     id: 'sponsorship_deal',
     category: 'Finance',
+    mode: 'choice',
+    touches: ['media'],
     weight: (p) => p.reputation >= 30 ? 8 : 2,
     beat: (p) => {
       const brand = pick(['a regional car dealership', 'a supplement brand', 'a local pub chain', 'a streetwear label']);
       const amount = Math.round(1000 + p.reputation * 80 + Math.random() * 4000);
-      return { brand, amount, text: `${brand.charAt(0).toUpperCase() + brand.slice(1)} wants your face on their next campaign — $${amount.toLocaleString()}, six months, moderate demands on your time.` };
+      return { brand, amount, text: `${brand.charAt(0).toUpperCase() + brand.slice(1)} wants your face on their next campaign — $${amount.toLocaleString()}, six months, moderate demands on your time. Interested?` };
     },
-    choices: [
-      {
-        id: 'sign_sponsor',
-        label: 'Sign the deal',
+    suggestions: ['Sign the deal', 'Pass — keep the focus on football'],
+    branches: [
+      { id: 'sign', matchWords: ['sign', 'yes', 'take', 'deal', 'do it'], default: true,
         effects: (p, v) => { p.cash += v.amount; p.relationships.media += 5; p.form -= 2; },
-        outcome: (p, v) => `Done. The ${v.brand} money lands in your account, and your face lands on a billboard you didn't expect to see on the way to training.`
-      },
-      {
-        id: 'pass_sponsor',
-        label: 'Pass — keep the focus on football',
+        hint: (v) => `Done. The ${v.brand} money lands in your account, and your face lands on a billboard you didn't expect to see on the way to training.` },
+      { id: 'pass', matchWords: ['pass', 'no', 'skip', 'not interested'],
         effects: (p) => { p.form += 3; },
-        outcome: () => `You pass. Your manager isn't thrilled, but your week stays simple.`
-      }
+        hint: () => `You pass. Your manager isn't thrilled, but your week stays simple.` }
     ]
   },
   {
     id: 'investment_tip',
     category: 'Finance',
+    mode: 'choice',
+    touches: [],
     weight: (p) => p.age >= 20 ? 6 : 0,
-    beat: (p) => ({ text: `A teammate's cousin is raising money for a property flip and swears it's a sure thing. He's asking $${(5000 + Math.round(p.reputation * 30)).toLocaleString()} in.` }),
-    choices: [
-      {
-        id: 'invest',
-        label: 'Put the money in',
+    beat: (p) => ({ text: `A teammate's cousin is raising money for a property flip and swears it's a sure thing. He's asking $${(5000 + Math.round(p.reputation * 30)).toLocaleString()} in. Are you putting money in?` }),
+    suggestions: ['Put the money in', `Keep my money where it is`],
+    branches: [
+      { id: 'invest', matchWords: ['invest', 'put', 'yes', 'in', 'do it'],
         effects: (p) => {
           const amount = 5000 + Math.round(p.reputation * 30);
           const win = Math.random() < 0.45;
           p.cash += win ? Math.round(amount * (0.5 + Math.random())) : -amount;
           p.flags.lastInvestOutcome = win ? 'win' : 'loss';
         },
-        outcome: (p) => p.flags.lastInvestOutcome === 'win'
-          ? `It actually comes off. Not life-changing money, but a nice surprise a few months later.`
-          : `It falls over inside a year. The cousin stops returning calls.`
-      },
-      {
-        id: 'skip_invest',
-        label: `Keep your money where it is`,
+        hint: (v, p) => p.flags.lastInvestOutcome === 'win' ? `It actually comes off. Not life-changing money, but a nice surprise a few months later.` : `It falls over inside a year. The cousin stops returning calls.` },
+      { id: 'skip', matchWords: ['no', 'skip', 'pass', 'keep'], default: true,
         effects: () => {},
-        outcome: () => `You wish him luck and keep your hands off your own savings.`
-      }
-    ]
-  },
-  {
-    id: 'night_out_before_match',
-    category: 'Nightlife',
-    touches: ['teammates'],
-    weight: (p) => 7,
-    beat: (p) => ({ text: `Thursday night, a few of the boys are heading out. Captain's run is 9am tomorrow, then a match Saturday.` }),
-    choices: [
-      {
-        id: 'go_big',
-        label: 'Go all in, worry about it tomorrow',
-        effects: (p) => { p.form -= 10; p.relationships.teammates += 8; p.relationships.coach -= 6; p.stats.fitness -= 2; },
-        outcome: () => `It's a big one. Fun at the time. The captain's run the next morning is not.`
-      },
-      {
-        id: 'one_or_two',
-        label: 'Go, but keep it controlled',
-        effects: (p) => { p.relationships.teammates += 5; },
-        outcome: () => `You stay long enough to not be the guy who left early, and leave early enough to not regret it.`
-      },
-      {
-        id: 'skip_night',
-        label: 'Stay home, protect the week',
-        effects: (p) => { p.form += 6; p.relationships.teammates -= 4; },
-        outcome: () => `You skip it. Someone posts a video from the night out; you're not in it, and a couple of the boys notice.`
-      }
-    ]
-  },
-  {
-    id: 'media_scandal',
-    category: 'Reputation',
-    touches: ['media'],
-    weight: (p) => p.relationships.media < 0 ? 9 : 2,
-    beat: (p) => ({ text: `A tabloid has run a story built on a half-true version of your night out last week, sourced from "a club insider."` }),
-    choices: [
-      {
-        id: 'fight_back',
-        label: 'Come out swinging publicly',
-        effects: (p) => { p.relationships.media -= 15; p.reputation -= 5; p.relationships.teammates += 5; },
-        outcome: () => `Your statement is sharp and a little too honest. The story gets more attention, not less.`
-      },
-      {
-        id: 'no_comment',
-        label: 'Say nothing, let it die',
-        effects: (p) => { p.relationships.media += 2; p.form -= 3; },
-        outcome: () => `You say nothing. It cycles out of the news in about four days, the way most of these do.`
-      },
-      {
-        id: 'club_statement',
-        label: 'Let the club handle the response',
-        effects: (p) => { p.relationships.coach += 5; p.relationships.media += 5; },
-        outcome: () => `The club's media manager puts out three careful sentences. It works better than anything you'd have said yourself.`
-      }
+        hint: () => `You wish him luck and keep your hands off your own savings.` }
     ]
   },
   {
     id: 'charity_appearance',
     category: 'Reputation',
+    mode: 'choice',
     touches: ['media'],
     weight: () => 6,
-    beat: (p) => ({ text: `The club asks if you'll spend a Wednesday afternoon visiting the children's hospital as part of the community program.` }),
-    choices: [
-      {
-        id: 'go_charity',
-        label: 'Go, and mean it',
+    beat: () => ({ text: `The club asks if you'll spend a Wednesday afternoon visiting the children's hospital as part of the community program. Are you going?` }),
+    suggestions: ['Go, and mean it', `Send apologies, too much on this week`],
+    branches: [
+      { id: 'go', matchWords: ['go', 'yes', 'attend', 'sure'], default: true,
         effects: (p) => { p.reputation += 8; p.relationships.media += 6; p.form += 2; },
-        outcome: () => `It's a better afternoon than you expected. One kid asks for your headgear and you give it to him on the spot.`
-      },
-      {
-        id: 'skip_charity',
-        label: `Send apologies, too much on this week`,
+        hint: () => `It's a better afternoon than you expected. One kid asks for your headgear and you give it to him on the spot.` },
+      { id: 'skip', matchWords: ['no', 'skip', 'busy', 'apolog'],
         effects: (p) => { p.reputation -= 3; },
-        outcome: () => `You skip it. Nobody says anything, but the community manager's next email is a little cooler than usual.`
-      }
-    ]
-  },
-  {
-    id: 'teammate_conflict',
-    category: 'Relationships',
-    touches: ['teammates'],
-    weight: (p) => p.relationships.teammates < 0 ? 10 : 3,
-    beat: (p) => ({ text: `Words in the sheds after a loss. A senior teammate says, loudly, that your positioning cost the team the game.` }),
-    choices: [
-      {
-        id: 'confront',
-        label: 'Have it out with him directly',
-        effects: (p) => { p.relationships.teammates -= 10; p.form += 4; },
-        outcome: () => `It gets heated before someone steps between you. You clear the air, roughly.`
-      },
-      {
-        id: 'let_it_go',
-        label: 'Let it go, deal with it on the field',
-        effects: (p) => { p.relationships.teammates += 6; p.form -= 4; },
-        outcome: () => `You say nothing and let your next few sessions do the talking instead.`
-      }
+        hint: () => `You skip it. Nobody says anything, but the community manager's next email is a little cooler than usual.` }
     ]
   },
   {
     id: 'new_relationship',
     category: 'Relationships',
+    mode: 'choice',
     touches: ['partner'],
     weight: (p) => (!p.partner && p.age >= 19) ? 8 : 0,
-    beat: (p) => ({ text: `Someone keeps coming up in conversation with your mates — a friend of a friend, no connection to the club or the game.` }),
-    choices: [
-      {
-        id: 'pursue_relationship',
-        label: 'Ask them out',
+    beat: () => ({ text: `Someone keeps coming up in conversation with your mates — a friend of a friend, no connection to the club or the game. Do you do anything about it?` }),
+    suggestions: ['Ask them out', 'Not the right time'],
+    branches: [
+      { id: 'pursue', matchWords: ['ask', 'yes', 'pursue', 'go for it', 'do it'], default: true,
         effects: (p) => { p.partner = { name: pick(['Alex', 'Maya', 'Jordan', 'Sam', 'Riley', 'Casey']), value: 20 }; p.form += 5; },
-        outcome: (p) => `You go for it. It's early days, but it's good — someone in your corner who couldn't care less what round it is.`
-      },
-      {
-        id: 'skip_relationship',
-        label: 'Not the right time',
+        hint: () => `You go for it. It's early days, but it's good — someone in your corner who couldn't care less what round it is.` },
+      { id: 'skip', matchWords: ['no', 'not', 'skip', 'later'],
         effects: () => {},
-        outcome: () => `You keep things as they are. There'll be other Saturdays.`
-      }
-    ]
-  },
-  {
-    id: 'partner_date_night',
-    category: 'Relationships',
-    touches: ['partner'],
-    weight: (p) => (p.partner ? 10 : 0),
-    beat: (p) => ({ text: `${p.partner.name} books a table somewhere neither of you have been, no real occasion, just a Tuesday you both happen to be free.` }),
-    choices: [
-      {
-        id: 'be_present',
-        label: 'Put the phone away and be there',
-        effects: (p) => { p.partner.value += 10; p.form += 3; },
-        outcome: (p) => `You actually switch off for a couple of hours. ${p.partner.name} notices, and says so.`
-      },
-      {
-        id: 'half_there',
-        label: `Go, but keep half an eye on club group chats`,
-        effects: (p) => { p.partner.value -= 4; p.relationships.teammates += 2; },
-        outcome: (p) => `You're there, mostly. ${p.partner.name} clocks the phone checks and doesn't love it.`
-      }
-    ]
-  },
-  {
-    id: 'partner_distance_strain',
-    category: 'Relationships',
-    touches: ['partner'],
-    weight: (p) => (p.partner && p.partner.value < 25 ? 11 : 3),
-    beat: (p) => ({ text: `Training, recovery, review, repeat — ${p.partner.name} points out you've eaten dinner together twice this month.` }),
-    choices: [
-      {
-        id: 'block_out_time',
-        label: 'Block out a proper night, no football talk',
-        effects: (p) => { p.partner.value += 14; p.form -= 2; },
-        outcome: (p) => `You clear the calendar for once. It costs you a recovery session; it's worth it.`
-      },
-      {
-        id: 'promise_later',
-        label: `Promise it'll ease up after finals`,
-        effects: (p) => { p.partner.value -= 6; },
-        outcome: () => `You say what you always say. You both know roughly how that promise tends to go.`
-      }
+        hint: () => `You keep things as they are. There'll be other Saturdays.` }
     ]
   },
   {
     id: 'partner_moving_in',
     category: 'Relationships',
+    mode: 'choice',
     touches: ['partner'],
     weight: (p) => (p.partner && p.partner.value > 30 && p.season >= 2 && !p.flags.movedIn ? 9 : 0),
-    beat: (p) => ({ text: `${p.partner.name} raises it carefully, like they've been rehearsing it: maybe it's time you both got a place together.` }),
-    choices: [
-      {
-        id: 'move_in_yes',
-        label: 'Say yes',
+    beat: (p) => ({ text: `${p.partner.name} raises it carefully, like they've been rehearsing it: maybe it's time you both got a place together. What do you say?` }),
+    suggestions: ['Say yes', 'Ask for more time'],
+    branches: [
+      { id: 'yes', matchWords: ['yes', 'say yes', 'sure', 'do it'], default: true,
         effects: (p) => { p.flags.movedIn = true; p.partner.value += 18; p.cash -= 3000; p.form += 4; },
-        outcome: (p) => `You say yes. Moving boxes into a place that's actually both of yours feels bigger than any win so far this season.`
-      },
-      {
-        id: 'move_in_not_yet',
-        label: 'Ask for more time',
+        hint: (v, p) => `You say yes. Moving boxes into a place that's actually both of yours feels bigger than any win so far this season.` },
+      { id: 'wait', matchWords: ['more time', 'not yet', 'wait', 'no'],
         effects: (p) => { p.partner.value -= 10; },
-        outcome: (p) => `You ask for more time. ${p.partner.name} says that's fine, in a tone that means it isn't, quite.`
-      }
+        hint: (v, p) => `You ask for more time. ${p.partner.name} says that's fine, in a tone that means it isn't, quite.` }
     ]
   },
   {
     id: 'partner_proposal',
     category: 'Relationships',
+    mode: 'choice',
     touches: ['partner'],
     weight: (p) => (p.partner && p.partner.value > 60 && p.season >= 3 && !p.flags.engaged ? 8 : 0),
-    beat: (p) => ({ text: `You've been turning the idea over for weeks. ${p.partner.name} has no idea tonight is any different from any other.` }),
-    choices: [
-      {
-        id: 'propose_yes',
-        label: 'Ask them to marry you',
+    beat: (p) => ({ text: `You've been turning the idea over for weeks. ${p.partner.name} has no idea tonight is any different from any other. Do you ask?` }),
+    suggestions: ['Ask them to marry you', 'Not yet — wait for the right moment'],
+    branches: [
+      { id: 'propose', matchWords: ['yes', 'ask', 'propose', 'marry', 'do it'], default: true,
         effects: (p) => { p.flags.engaged = true; p.partner.value += 15; p.reputation += 5; p.relationships.media += 8; },
-        outcome: (p) => `${p.partner.name} says yes before you've finished the sentence. The club finds out before your parents do.`
-      },
-      {
-        id: 'propose_wait',
-        label: 'Not yet — wait for the right moment',
+        hint: (v, p) => `${p.partner.name} says yes before you've finished the sentence. The club finds out before your parents do.` },
+      { id: 'wait', matchWords: ['no', 'not yet', 'wait'],
         effects: () => {},
-        outcome: () => `You put the ring back in the drawer. There'll be another night for it.`
-      }
+        hint: () => `You put the ring back in the drawer. There'll be another night for it.` }
     ]
   },
   {
     id: 'partner_ultimatum',
     category: 'Relationships',
+    mode: 'choice',
     touches: ['partner'],
     weight: (p) => (p.partner && p.partner.value < -20) ? 14 : 0,
-    beat: (p) => ({ text: `${p.partner ? p.partner.name : 'Your partner'} sits you down. The football is taking every week, every weekend, every ounce of attention you have left.` }),
-    choices: [
-      {
-        id: 'recommit',
-        label: 'Recommit — make the time',
+    beat: (p) => ({ text: `${p.partner.name} sits you down. The football is taking every week, every weekend, every ounce of attention you have left. How do you respond?` }),
+    suggestions: ['I recommit and make the time', 'I\'m honest that football comes first right now'],
+    branches: [
+      { id: 'recommit', matchWords: ['recommit', 'make time', 'sorry', 'yes', 'change'], default: true,
         effects: (p) => { p.partner.value += 25; p.form -= 4; p.relationships.coach -= 3; },
-        outcome: () => `You mean it, and for a while you follow through. Training takes a small, deliberate back seat.`
-      },
-      {
-        id: 'choose_football',
-        label: 'Be honest that football comes first right now',
+        hint: () => `You mean it, and for a while you follow through. Training takes a small, deliberate back seat.` },
+      { id: 'football_first', matchWords: ['football first', 'honest', 'no', 'priority'],
         effects: (p) => {
           const stay = Math.random() < 0.3;
-          if (!stay) { p.partner = null; p.form -= 8; p.reputation -= 2; }
-          else { p.partner.value = -5; }
+          if (!stay) { p.partner = null; p.form -= 8; p.reputation -= 2; } else { p.partner.value = -5; }
           p.flags.chosePlayingCareer = true;
         },
-        outcome: (p) => p.partner ? `It's a hard conversation, but you're honest, and somehow it holds.` : `The honesty costs you the relationship. It's a quiet few weeks after.`
-      }
-    ]
-  },
-  {
-    id: 'family_pressure',
-    category: 'Relationships',
-    weight: (p) => (p.background === 'family_club' ? 8 : 3),
-    beat: (p) => ({ text: `Family turns up in numbers to the next home game — the kind of crowd that expects a performance to match the name on your jersey.` }),
-    choices: [
-      {
-        id: 'embrace_pressure',
-        label: 'Embrace it, play for the name',
-        effects: (p) => { p.form += 6; p.reputation += 3; },
-        outcome: () => `You feed off it. The old name on your back feels less like weight and more like fuel, for once.`
-      },
-      {
-        id: 'block_it_out',
-        label: 'Block it out, play your own game',
-        effects: (p) => { p.form += 2; p.relationships.family = (p.relationships.family || 0) - 3; },
-        outcome: () => `You keep it strictly business and play a solid, unremarkable eighty minutes. Not everyone in the stand is satisfied.`
-      }
+        hint: (v, p) => p.partner ? `It's a hard conversation, but you're honest, and somehow it holds.` : `The honesty costs you the relationship. It's a quiet few weeks after.` }
     ]
   },
   {
     id: 'retirement_contemplation',
     category: 'Career',
+    mode: 'choice',
+    touches: ['coach'],
     weight: (p) => p.age >= 32 ? 10 : 0,
-    beat: (p) => ({ text: `Pre-season medicals come back with the usual list of ongoing niggles. Your manager asks, plainly, how many more years you think you've got in you.` }),
-    choices: [
-      {
-        id: 'play_on',
-        label: 'Sign on for another season',
+    beat: () => ({ text: `Pre-season medicals come back with the usual list of ongoing niggles. Your manager asks, plainly, how many more years you think you've got in you.` }),
+    suggestions: ['Sign on for another season', 'Call it — retire at the end of this season'],
+    branches: [
+      { id: 'play_on', matchWords: ['sign on', 'another season', 'play on', 'yes', 'continue'], default: true,
         effects: (p) => { p.stats.fitness = clamp(p.stats.fitness - 4, 10, 100); p.contractYearsLeft = Math.max(p.contractYearsLeft, 1); },
-        outcome: () => `You sign on. Your body notices the decision before your form does.`
-      },
-      {
-        id: 'retire_now',
-        label: 'Call it — retire at the end of this season',
+        hint: () => `You sign on. Your body notices the decision before your form does.` },
+      { id: 'retire', matchWords: ['retire', 'call it', 'done', 'finish'],
         effects: (p) => { p.flags.plannedRetirement = true; },
-        outcome: () => `You tell your manager first, then the coach. Word gets around the club within a day.`
-      }
+        hint: () => `You tell your manager first, then the coach. Word gets around the club within a day.` }
     ]
   }
 ];
@@ -485,19 +478,18 @@ function simulateMatch(player) {
 
   // Experience dampens variance and raises the ceiling — a debutant with
   // no games and modest stats should mostly post ordinary, forgettable
-  // performances, not 9s and 10s. Ratings only get consistently high once
-  // both skill AND games-played back it up.
+  // performances, not 9s and 10s.
   const experience = clamp(player.careerStats.matches / 30, 0, 1); // 0 debut -> 1 veteran (30+ games)
-  const skill = (player.stats.attack + player.stats.defense + player.stats.kicking) / 3; // ~10-100
-  const skillNorm = clamp((skill - 30) / 55, 0, 1); // ~30 skill -> 0, ~85 skill -> 1
+  const skill = (player.stats.power + player.stats.steel + player.stats.boot) / 3; // ~10-100
+  const skillNorm = clamp((skill - 30) / 55, 0, 1);
   const formNorm = player.form / 100; // -1..1
-  const spread = 2.6 - experience * 1.3; // rookies swing wide, veterans are more consistent
-  const luck = (Math.random() + Math.random() - 1) * spread; // roughly triangular, centered on 0
+  const spread = 2.6 - experience * 1.3;
+  const luck = (Math.random() + Math.random() - 1) * spread;
 
   let rating = 4 + skillNorm * 2.6 + formNorm * 1.3 + experience * 0.6 + luck;
   rating = clamp(rating, 1, 10);
 
-  const playerImpact = clamp((rating - 5.5) * 8, -22, 34); // feeds the scoreline and moment picks
+  const playerImpact = clamp((rating - 5.5) * 8, -22, 34);
 
   const ownTeamBase = 12 + Math.random() * 14;
   const oppBase = 8 + opponent.tier * 1.6 + Math.random() * 14;
@@ -506,7 +498,6 @@ function simulateMatch(player) {
   let oppScore = Math.round(oppBase);
   ownScore = clamp(ownScore, 0, 60);
   oppScore = clamp(oppScore, 0, 60);
-  // round to plausible try/goal scorelines
   ownScore = Math.round(ownScore / 2) * 2;
   oppScore = Math.round(oppScore / 2) * 2;
 
@@ -520,7 +511,6 @@ function simulateMatch(player) {
   moments.push({ minute: Math.floor(50 + Math.random() * 30), type: won ? 'clutch' : 'fightback', tag: won ? 'held the lead late' : 'chased the game late' });
   moments.sort((a, b) => a.minute - b.minute);
 
-  // injury chance, lower fitness = higher risk
   const injuryRoll = Math.random();
   const injuryThreshold = 0.05 + (100 - player.stats.fitness) / 100 * 0.06;
   const injured = injuryRoll < injuryThreshold;
@@ -543,10 +533,12 @@ function createPlayer(form) {
     round: 1,
     phase: 'inseason',
     stats: {
-      attack: 45 + bg.statBonus.attack,
-      defense: 45 + bg.statBonus.defense,
-      kicking: 40 + bg.statBonus.kicking,
-      fitness: 70 + bg.statBonus.fitness
+      power: 45 + bg.statBonus.power,
+      steel: 45 + bg.statBonus.steel,
+      boot: 40 + bg.statBonus.boot,
+      fitness: 70 + bg.statBonus.fitness,
+      charisma: 40 + bg.statBonus.charisma,
+      composure: 45 + bg.statBonus.composure
     },
     form: 0,
     reputation: bg.repStart,
@@ -567,32 +559,19 @@ function createPlayer(form) {
   };
 }
 
-// A "week" is the unit every part of the game advances on. Anything that
-// consumes one goes through here so the neglect clock and the round/season
-// counters never drift apart.
-const NEGLECT_THRESHOLD = 3; // weeks of silence before a relationship starts to slide
-
 function consumeWeek() {
   player.round += 1;
   player.totalWeeks += 1;
   applyNeglectDecay();
 }
 
-function touch(cat) {
-  player.lastInteraction[cat] = player.totalWeeks;
-}
+function touch(cat) { player.lastInteraction[cat] = player.totalWeeks; }
 
 function applyNeglectDecay() {
   const p = player;
-  if (p.totalWeeks - p.lastInteraction.coach > NEGLECT_THRESHOLD) {
-    p.relationships.coach = clamp(p.relationships.coach - 2, -100, 100);
-  }
-  if (p.totalWeeks - p.lastInteraction.teammates > NEGLECT_THRESHOLD) {
-    p.relationships.teammates = clamp(p.relationships.teammates - 1, -100, 100);
-  }
-  if (p.totalWeeks - p.lastInteraction.media > NEGLECT_THRESHOLD) {
-    p.relationships.media = clamp(p.relationships.media - 1, -100, 100);
-  }
+  if (p.totalWeeks - p.lastInteraction.coach > NEGLECT_THRESHOLD) p.relationships.coach = clamp(p.relationships.coach - 2, -100, 100);
+  if (p.totalWeeks - p.lastInteraction.teammates > NEGLECT_THRESHOLD) p.relationships.teammates = clamp(p.relationships.teammates - 1, -100, 100);
+  if (p.totalWeeks - p.lastInteraction.media > NEGLECT_THRESHOLD) p.relationships.media = clamp(p.relationships.media - 1, -100, 100);
   if (p.partner && p.totalWeeks - p.lastInteraction.partner > NEGLECT_THRESHOLD) {
     p.partner.value = clamp(p.partner.value - 3, -100, 100);
     if (p.partner.value <= -55 && Math.random() < 0.2) {
@@ -607,10 +586,7 @@ function applyEffectsSafe(p, fn, vars) {
   try { fn(p, vars); } catch (e) { console.error('effect error', e); }
   p.form = clamp(p.form, -100, 100);
   p.reputation = clamp(p.reputation, 0, 100);
-  p.stats.attack = clamp(p.stats.attack, 10, 100);
-  p.stats.defense = clamp(p.stats.defense, 10, 100);
-  p.stats.kicking = clamp(p.stats.kicking, 10, 100);
-  p.stats.fitness = clamp(p.stats.fitness, 10, 100);
+  ATTRS.forEach(a => { p.stats[a] = clamp(p.stats[a], 10, 100); });
   p.relationships.coach = clamp(p.relationships.coach, -100, 100);
   p.relationships.teammates = clamp(p.relationships.teammates, -100, 100);
   p.relationships.media = clamp(p.relationships.media, -100, 100);
@@ -640,12 +616,7 @@ async function callClaude(system, user, maxTokens = 300) {
       'anthropic-version': '2023-06-01',
       'anthropic-dangerous-direct-browser-access': 'true'
     },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: maxTokens,
-      system,
-      messages: [{ role: 'user', content: user }]
-    })
+    body: JSON.stringify({ model: MODEL, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] })
   });
   if (!res.ok) {
     const errText = await res.text().catch(() => '');
@@ -666,8 +637,21 @@ function playerSnapshotForPrompt(p) {
 }
 
 async function narrateEventOpening(template, vars, p) {
-  const system = `You are the narrator for LAST TACKLE, a text-based rugby league career sim. You are given a fixed situation ("beat") that has already been decided by the game engine — you do not invent outcomes, stats, or choices, you only bring the moment to life. Write 2-4 short sentences, second person ("you"), grounded and understated rather than melodramatic — think of a good sports novel, not a movie trailer. No dialogue tags like 'the narrator says'. Do not mention game mechanics, numbers, or stats directly. Output only the narration, no preamble.`;
+  const system = `You are the narrator for LAST TACKLE, a rugby league career sim played like a tabletop RPG scene. You are given a fixed situation ("beat") already decided by the game engine — you do not invent outcomes or choices. Write 2-4 short sentences, second person ("you"), grounded and understated — think of a good sports novel, not a movie trailer. End by making clear the player needs to decide what to do (the game will ask them to type their own action, so don't list options yourself). No dialogue tags. Output only the narration, no preamble.`;
   const user = `Player: ${JSON.stringify(playerSnapshotForPrompt(p))}\nSituation: ${vars.text}`;
+  return callClaude(system, user, 220);
+}
+
+async function narrateFreeformOutcome(template, vars, p, actionText, resolved) {
+  const system = `You are narrating the outcome of a scene in LAST TACKLE, a rugby league career sim played like a tabletop RPG. The game engine has ALREADY decided exactly what happens — given to you as "outcome" — you only bring it to life in 2-4 sentences, second person, grounded and understated. Weave in what the player said they did, but do not quote it verbatim back at them. Do not change the outcome, invent a different result, or add consequences beyond what's given. No dialogue tags, no preamble, output only the narration.`;
+  const rollLine = resolved.mode === 'check'
+    ? `This was resolved as a ${ATTR_LABELS[resolved.skill]} check, played ${resolved.boldness}, result: ${resolved.tier === 'critSuccess' ? 'a clean, decisive success' : resolved.tier === 'success' ? 'a modest success' : resolved.tier === 'fail' ? 'a clear failure' : 'a disastrous failure'}.`
+    : '';
+  const user = `Player: ${JSON.stringify(playerSnapshotForPrompt(p))}
+Situation: ${vars.text}
+The player's stated action: "${actionText}"
+${rollLine}
+Outcome (what actually happened, do not contradict this): ${resolved.hint}`;
   return callClaude(system, user, 220);
 }
 
@@ -688,43 +672,38 @@ Key moments in order: ${result.moments.map(m => `minute ${m.minute}: ${m.tag}`).
   } catch (e) {
     return {
       commentary: result.moments.map(m => `${m.minute}': ${m.tag}.`),
-      recap: result.won
-        ? `A solid win. Your performance graded ${result.rating.toFixed(1)}/10 on the day.`
-        : `A tough loss to take. Your performance graded ${result.rating.toFixed(1)}/10 on the day.`
+      recap: result.won ? `A solid win. Your performance graded ${result.rating.toFixed(1)}/10 on the day.` : `A tough loss to take. Your performance graded ${result.rating.toFixed(1)}/10 on the day.`
     };
   }
 }
 
-// ---------- Static (no-AI) recovery week lines, cached to save calls ----------
+// ---------- Static (no-AI) lines, cached to save calls ----------
 
 const RECOVERY_LINES = [
   'Rehab is repetition. Ice, stretch, repeat — the injury clock ticks down slower than the season does.',
-  'You spend the week on the sideline in a training bib, watching a game you can\'t play in yet.',
+  `You spend the week on the sideline in a training bib, watching a game you can't play in yet.`,
   'The physio says the same thing she said last week: progressing, not rushing. You believe her, mostly.',
-  'A quiet week. You do the boring work nobody posts about and try not to think about the ladder.'
+  `A quiet week. You do the boring work nobody posts about and try not to think about the ladder.`
 ];
-
-// ---------- Proactive tab actions (static text, no API call — these are ----------
-// ---------- meant to be used often, so they stay cheap and instant)     ----------
 
 const TAB_LINES = {
   partner: [
     'You call, no reason, just to hear how their day went. It runs long.',
-    'You show up with dinner sorted so neither of you has to think about it.',
+    `You show up with dinner sorted so neither of you has to think about it.`,
     'You actually ask a follow-up question instead of talking about training.',
-    'A dumb inside joke over text turns into twenty minutes of nothing important, and it\'s good.'
+    `A dumb inside joke over text turns into twenty minutes of nothing important, and it's good.`
   ],
   coach: [
     'You catch him after the video session and ask what he actually wants from you this week.',
     'You stay back to run extra kicks with him watching. He notices the initiative.',
-    'A short, honest chat in his office — no agenda, just where you both stand.',
+    `A short, honest chat in his office — no agenda, just where you both stand.`,
     'You ask directly what he thinks you need to work on. He appreciates being asked.'
   ],
   teammates: [
     'You buy the coffees before the video session. Small thing, lands well.',
-    'You stick around after training to help the young fringe player with his kicking.',
-    'A round of golf with a few of the boys, no football talked about for once.',
-    'You check in on a teammate who\'s been quiet lately. Turns out he needed the ask.'
+    `You stick around after training to help the young fringe player with his kicking.`,
+    `A round of golf with a few of the boys, no football talked about for once.`,
+    `You check in on a teammate who's been quiet lately. Turns out he needed the ask.`
   ],
   media: [
     'You do a longer sit-down interview than you needed to, and it comes across well.',
@@ -736,32 +715,22 @@ const TAB_LINES = {
 
 const MEET_SUCCESS_LINES = [
   'You strike up a conversation that has no business going as well as it does.',
-  'A mutual friend finally makes the introduction they\'ve been threatening for months.',
-  'Something clicks over a conversation that starts about nothing and doesn\'t stop.'
+  `A mutual friend finally makes the introduction they've been threatening for months.`,
+  `Something clicks over a conversation that starts about nothing and doesn't stop.`
 ];
 const MEET_FAIL_LINES = [
-  'Nothing this week. You put yourself out there and it just doesn\'t land.',
-  'A near-miss — good conversation, no follow-through. Maybe next time.',
+  `Nothing this week. You put yourself out there and it just doesn't land.`,
+  `A near-miss — good conversation, no follow-through. Maybe next time.`,
   'Training and recovery eat the week before anything has a chance to happen.'
 ];
 
 const TRAINING_LINES = {
-  attack: [
-    'Extra ball-work after the main session, the kind nobody\'s filming.',
-    'You drill the same play forty times until it stops feeling deliberate.'
-  ],
-  defense: [
-    'A brutal extra tackle-technique session with the conditioning coach.',
-    'You watch your own missed tackles back on loop until the fix is obvious.'
-  ],
-  kicking: [
-    'An hour alone on an empty field, just you and a bag of balls.',
-    'You work the kicking tee until the angle stops needing thought.'
-  ],
-  fitness: [
-    'An extra recovery session — ice bath, stretching, the unglamorous stuff.',
-    'You take the rest day seriously for once instead of half-taking it.'
-  ]
+  power: ['Extra ball-work after the main session, the kind nobody\'s filming.', 'You drill the same play forty times until it stops feeling deliberate.'],
+  steel: ['A brutal extra tackle-technique session with the conditioning coach.', 'You watch your own missed tackles back on loop until the fix is obvious.'],
+  boot: ['An hour alone on an empty field, just you and a bag of balls.', 'You work the kicking tee until the angle stops needing thought.'],
+  fitness: ['An extra recovery session — ice bath, stretching, the unglamorous stuff.', 'You take the rest day seriously for once instead of half-taking it.'],
+  charisma: ['A media-training session on staying sharp in front of a camera.', 'You sit in on a sponsor meeting just to get more comfortable talking business.'],
+  composure: ['An hour with the club\'s sports psychologist, working through the pressure moments.', 'You run through visualisation drills the way the older pros swear by.']
 };
 
 function spendTime(cat) {
@@ -781,9 +750,7 @@ function meetSomeone() {
   if (player.lastInteraction.partner === player.totalWeeks) { toast('Already tried this week.'); return; }
   touch('partner');
   const success = Math.random() < 0.4;
-  if (success) {
-    player.partner = { name: pick(['Alex', 'Maya', 'Jordan', 'Sam', 'Riley', 'Casey']), value: 15 };
-  }
+  if (success) player.partner = { name: pick(['Alex', 'Maya', 'Jordan', 'Sam', 'Riley', 'Casey']), value: 15 };
   save();
   renderRelationshipTab('partner', success ? pick(MEET_SUCCESS_LINES) : pick(MEET_FAIL_LINES));
   renderSheet();
@@ -795,13 +762,13 @@ function trainStat(stat) {
   touch('training');
   if (stat === 'fitness') {
     player.stats.fitness = clamp(player.stats.fitness + 3 + Math.floor(Math.random() * 4), 10, 100);
+  } else if (stat === 'charisma' || stat === 'composure') {
+    player.stats[stat] = clamp(player.stats[stat] + 2 + Math.floor(Math.random() * 3), 10, 100);
   } else {
     player.stats[stat] = clamp(player.stats[stat] + 2 + Math.floor(Math.random() * 3), 10, 100);
     const overtrain = player.stats.fitness < 35 && Math.random() < 0.15;
     player.stats.fitness = clamp(player.stats.fitness - (2 + Math.floor(Math.random() * 4)), 10, 100);
-    if (overtrain) {
-      player.injuryWeeksLeft = Math.max(player.injuryWeeksLeft, 1);
-    }
+    if (overtrain) player.injuryWeeksLeft = Math.max(player.injuryWeeksLeft, 1);
   }
   save();
   renderTrainingTab(pick(TRAINING_LINES[stat]));
@@ -812,7 +779,7 @@ function trainStat(stat) {
 
 let player = null;
 let uiBusy = false;
-let currentScreenRenderer = null; // re-renders whatever the Overview tab was showing
+let currentScreenRenderer = null;
 let activeTab = 'overview';
 
 function eligibleTemplates(p) {
@@ -825,7 +792,6 @@ function eligibleTemplates(p) {
 async function advanceWeek() {
   if (uiBusy || !player || player.ended) return;
 
-  // Injury recovery
   if (player.injuryWeeksLeft > 0) {
     player.injuryWeeksLeft -= 1;
     consumeWeek();
@@ -835,7 +801,6 @@ async function advanceWeek() {
     return;
   }
 
-  // Off-season boundary
   if (player.round > ROUNDS_PER_SEASON) return handleOffseasonEntry();
 
   const eligible = eligibleTemplates(player);
@@ -864,15 +829,45 @@ async function runEvent(template) {
   setBusy(false);
 }
 
-function chooseOption(template, vars, choice) {
+async function submitFreeformAction(template, vars, actionText) {
   if (uiBusy) return;
-  applyEffectsSafe(player, choice.effects, vars);
-  const outcomeText = typeof choice.outcome === 'function' ? choice.outcome(player, vars) : '';
-  addLog(player, { season: player.season, round: player.round, headline: template.category, text: outcomeText });
+  const text = actionText.trim();
+  if (text.length < 3) { toast('Type a bit more about what you do.'); return; }
+
+  setBusy(true);
+  let resolved;
+  if (template.mode === 'check') {
+    const skill = classifySkill(text, template.primarySkills);
+    const boldness = classifyBoldness(text);
+    const roll = rollCheck(player.stats[skill], template.baseDC, boldness);
+    const tierData = template.outcomeTable[roll.degree];
+    applyEffectsSafe(player, tierData.effects, vars);
+    resolved = { mode: 'check', skill, boldness, roll, tier: roll.degree, hint: tierData.hint };
+  } else {
+    const branch = classifyBranch(text, template.branches);
+    applyEffectsSafe(player, branch.effects, vars);
+    resolved = { mode: 'choice', branch, hint: typeof branch.hint === 'function' ? branch.hint(vars, player) : branch.hint };
+  }
+
+  if (resolved.mode === 'check') {
+    await renderDiceRollAnimation(resolved.skill, resolved.boldness, resolved.roll);
+  }
+
+  renderLoading(template.category);
+  let narrative = resolved.hint;
+  try {
+    narrative = await narrateFreeformOutcome(template, vars, player, text, resolved);
+  } catch (e) {
+    console.error(e);
+    toast('Could not reach the AI for narration — showing a short summary instead.');
+  }
+
+  addLog(player, { season: player.season, round: player.round, headline: template.category, text: narrative });
   consumeWeek();
   if (template.touches) template.touches.forEach(touch);
-  renderOutcome(template, choice, outcomeText);
+  renderFreeformOutcome(template, text, resolved, narrative);
   save();
+  setBusy(false);
 }
 
 async function runMatch() {
@@ -897,9 +892,7 @@ function finalizeMatch(result, narration) {
   player.form += (result.rating - 5.5) * 2;
   player.reputation += (result.rating - 5.5) * 0.6;
   if (result.isRivalRound) player.reputation += result.won ? 3 : -1;
-  if (result.injured) {
-    player.injuryWeeksLeft = result.injuryWeeks;
-  }
+  if (result.injured) player.injuryWeeksLeft = result.injuryWeeks;
   consumeWeek();
   applyEffectsSafe(player, () => {});
   addLog(player, { season: player.season, round: player.round - 1, headline: 'Match', text: narration.recap });
@@ -911,7 +904,7 @@ function handleOffseasonEntry() {
   player.careerStats.seasons += 1;
   player.contractYearsLeft = Math.max(0, player.contractYearsLeft - 1);
 
-  if (player.flags.plannedRetirement || player.age >= 37 || player.contractYearsLeft <= 0 && player.age >= 34) {
+  if (player.flags.plannedRetirement || player.age >= 37 || (player.contractYearsLeft <= 0 && player.age >= 34)) {
     return endCareer();
   }
 
@@ -976,10 +969,7 @@ function renderSheet() {
     </div>
     <div class="sheet-block">
       <div class="sheet-label">ATTRIBUTES</div>
-      <div class="stat-row"><span>Attack</span><span class="v">${Math.round(p.stats.attack)}</span></div>
-      <div class="stat-row"><span>Defense</span><span class="v">${Math.round(p.stats.defense)}</span></div>
-      <div class="stat-row"><span>Kicking</span><span class="v">${Math.round(p.stats.kicking)}</span></div>
-      <div class="stat-row"><span>Fitness</span><span class="v">${Math.round(p.stats.fitness)}</span></div>
+      ${ATTRS.map(a => `<div class="stat-row"><span>${ATTR_LABELS[a]}</span><span class="v">${Math.round(p.stats[a])}</span></div>`).join('')}
     </div>
     <div class="sheet-block">
       <div class="sheet-label">RELATIONSHIPS</div>
@@ -1005,6 +995,44 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+function renderDiceRollAnimation(skill, boldness, roll) {
+  return new Promise(resolve => {
+    const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const boldNote = boldness !== 'standard' ? ` · played ${boldness}` : '';
+    stage.innerHTML = `
+      <div class="week-tag">${ATTR_LABELS[skill]} check${boldNote}</div>
+      <div class="dice-roll-stage">
+        <div class="d20-wrap" id="d20Wrap">
+          <div class="d20-diamond"></div>
+          <div class="d20-face" id="d20Face">?</div>
+        </div>
+        <div class="dice-roll-caption" id="diceCaption">Rolling…</div>
+      </div>
+    `;
+    const face = document.getElementById('d20Face');
+    const wrap = document.getElementById('d20Wrap');
+    const caption = document.getElementById('diceCaption');
+
+    const land = () => {
+      face.textContent = roll.d20;
+      if (roll.d20 === 20) { wrap.classList.add('crit-good'); caption.textContent = 'Natural 20!'; }
+      else if (roll.d20 === 1) { wrap.classList.add('crit-bad'); caption.textContent = 'Natural 1…'; }
+      else { caption.textContent = `${roll.d20} ${roll.mod >= 0 ? '+' : ''}${roll.mod} = ${roll.total} vs DC ${roll.dc}`; }
+      setTimeout(resolve, 700);
+    };
+
+    if (reduceMotion) { land(); return; }
+
+    let ticks = 0;
+    const maxTicks = 14;
+    const interval = setInterval(() => {
+      ticks++;
+      if (ticks >= maxTicks) { clearInterval(interval); land(); }
+      else { face.textContent = 1 + Math.floor(Math.random() * 20); }
+    }, 70);
+  });
+}
+
 function renderLoading(label) {
   stage.innerHTML = `<div class="week-tag">${escapeHtml(label)}</div><p class="loading-line">Writing the next chapter…</p>`;
 }
@@ -1021,34 +1049,56 @@ function renderApiError(err, retryFn) {
 
 function renderEventScreen(template, vars, text) {
   renderTopbar();
-  const choicesHtml = template.choices.map((c, i) => `
-    <button class="choice-btn" data-idx="${i}">${escapeHtml(c.label)}</button>
-  `).join('');
+  const chips = (template.suggestions || []).map((s, i) => `<button class="chip" data-chip="${i}">${escapeHtml(s)}</button>`).join('');
+  const hint = template.mode === 'check'
+    ? `<p class="freeform-hint">Describe what you do — how you go about it decides which of your attributes gets tested, and how bold you play it changes the risk.</p>`
+    : `<p class="freeform-hint">Describe what you do.</p>`;
   stage.innerHTML = `
     <div class="week-tag">${template.category} · Season ${player.season}, Round ${player.round}</div>
     <div class="narrative">${escapeHtml(text).split(/\n+/).map(p => `<p>${p}</p>`).join('')}</div>
-    <div class="choices">${choicesHtml}</div>
+    ${hint}
+    <div class="chip-row">${chips}</div>
+    <textarea class="freeform-box" id="freeformInput" placeholder="What do you do?" rows="2"></textarea>
+    <div class="continue-row"><button class="btn btn-primary" id="submitActionBtn">${template.mode === 'check' ? 'Roll for it' : 'Do it'}</button></div>
     ${renderLogHtml()}
   `;
-  stage.querySelectorAll('.choice-btn').forEach(btn => {
-    btn.addEventListener('click', () => chooseOption(template, vars, template.choices[parseInt(btn.dataset.idx, 10)]));
+  const inputEl = document.getElementById('freeformInput');
+  stage.querySelectorAll('.chip').forEach(btn => {
+    btn.addEventListener('click', () => { inputEl.value = template.suggestions[parseInt(btn.dataset.chip, 10)]; inputEl.focus(); });
   });
+  document.getElementById('submitActionBtn').addEventListener('click', () => submitFreeformAction(template, vars, inputEl.value));
   renderSheet();
   currentScreenRenderer = () => renderEventScreen(template, vars, text);
   setActiveTab('overview', { skipRender: true });
 }
 
-function renderOutcome(template, choice, outcomeText) {
+const TIER_LABEL = { critSuccess: 'Critical success', success: 'Success', fail: 'Fail', critFail: 'Critical fail' };
+const TIER_CLASS = { critSuccess: 'good', success: 'good', fail: 'warn', critFail: 'warn' };
+
+function renderFreeformOutcome(template, actionText, resolved, narrative) {
   renderTopbar();
+  let diceHtml = '';
+  if (resolved.mode === 'check') {
+    const r = resolved.roll;
+    const boldNote = resolved.boldness !== 'standard' ? ` · played ${resolved.boldness}` : '';
+    diceHtml = `
+      <div class="dice-strip">
+        <span class="tag ${TIER_CLASS[resolved.tier]}">${TIER_LABEL[resolved.tier]}</span>
+        <span class="dice-detail">${ATTR_LABELS[resolved.skill]} check · d20 (${r.d20}) ${r.mod >= 0 ? '+' : ''}${r.mod} = ${r.total} vs DC ${r.dc}${boldNote}</span>
+      </div>
+    `;
+  }
   stage.innerHTML = `
     <div class="week-tag">${template.category} · Season ${player.season}</div>
-    <div class="narrative"><p>${escapeHtml(outcomeText)}</p></div>
+    <div class="action-echo">You: ${escapeHtml(actionText)}</div>
+    ${diceHtml}
+    <div class="narrative"><p>${escapeHtml(narrative)}</p></div>
     <div class="continue-row"><button class="btn btn-primary" id="continueBtn">Continue</button></div>
     ${renderLogHtml()}
   `;
   document.getElementById('continueBtn').addEventListener('click', advanceWeek);
   renderSheet();
-  currentScreenRenderer = () => renderOutcome(template, choice, outcomeText);
+  currentScreenRenderer = () => renderFreeformOutcome(template, actionText, resolved, narrative);
   setActiveTab('overview', { skipRender: true });
 }
 
@@ -1134,11 +1184,14 @@ function renderLogHtml() {
   `).join('')}</div>`;
 }
 
+function confirmReset() {
+  if (confirm('Abandon this career? This cannot be undone.')) {
+    clearSave();
+    location.reload();
+  }
+}
+
 // ---------- Tabs (Girlfriend / Coach / Team / Media / Training) ----------
-// These let the player proactively invest in a relationship or a stat
-// instead of only reacting to whatever the random event roll serves up —
-// each is usable once per week and uses static (no-API) text, since they're
-// meant to be used often.
 
 const TAB_META = {
   partner: { label: 'Girlfriend', actionLabel: 'Spend time together' },
@@ -1198,16 +1251,16 @@ function renderTrainingTab(resultLine) {
   if (uiBusy) return;
   const p = player;
   const disabled = usedThisWeek('training');
-  const rows = ['attack', 'defense', 'kicking', 'fitness'].map(stat => `
+  const rows = ATTRS.map(stat => `
     <div class="stat-row">
-      <span>${stat.charAt(0).toUpperCase() + stat.slice(1)} — ${Math.round(p.stats[stat])}</span>
+      <span>${ATTR_LABELS[stat]} — ${Math.round(p.stats[stat])}</span>
       <button class="btn" data-stat="${stat}" ${disabled ? 'disabled' : ''}>${stat === 'fitness' ? 'Recover' : 'Train'}</button>
     </div>
   `).join('');
   stage.innerHTML = `
     <div class="week-tag">Training</div>
     <div class="event-title">Extra sessions</div>
-    <div class="narrative"><p>One extra session a week, on top of whatever the club already has you doing. Training a skill costs a little fitness; recovery gets fitness back. Overtraining on low fitness risks a minor niggle.</p></div>
+    <div class="narrative"><p>One extra session a week. Training Power, Steel or Boot costs a little fitness; Charisma and Composure sessions don't. Overtraining on low fitness risks a minor niggle.</p></div>
     ${resultLine ? `<div class="narrative"><p>${escapeHtml(resultLine)}</p></div>` : ''}
     <div class="sheet-block">${rows}</div>
   `;
@@ -1215,13 +1268,6 @@ function renderTrainingTab(resultLine) {
     btn.addEventListener('click', () => trainStat(btn.dataset.stat));
   });
   renderSheet();
-}
-
-function confirmReset() {
-  if (confirm('Abandon this career? This cannot be undone.')) {
-    clearSave();
-    location.reload();
-  }
 }
 
 // ---------- Save / load ----------
@@ -1234,11 +1280,17 @@ function loadSave() {
     const raw = localStorage.getItem(SAVE_KEY);
     if (!raw) return null;
     const p = JSON.parse(raw);
-    // Backfill fields added after this save was written, so older saves
-    // from before the tabs/decay update still load instead of crashing.
-    if (!p.lastTemplateIds) p.lastTemplateIds = p.lastTemplateId ? [p.lastTemplateId] : [];
+    if (!p.lastTemplateIds) p.lastTemplateIds = [];
     if (typeof p.totalWeeks !== 'number') p.totalWeeks = (p.season - 1) * ROUNDS_PER_SEASON + (p.round - 1);
     if (!p.lastInteraction) p.lastInteraction = { partner: p.totalWeeks, coach: p.totalWeeks, teammates: p.totalWeeks, media: p.totalWeeks, training: p.totalWeeks };
+    if (!p.stats.power) {
+      // migrate from the old attack/defense/kicking attribute names
+      p.stats.power = p.stats.attack || 45;
+      p.stats.steel = p.stats.defense || 45;
+      p.stats.boot = p.stats.kicking || 40;
+      p.stats.charisma = p.stats.charisma || 40;
+      p.stats.composure = p.stats.composure || 45;
+    }
     return p;
   } catch (e) { return null; }
 }
