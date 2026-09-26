@@ -469,7 +469,7 @@ const EVENT_TEMPLATES = [
 
 // ---------- Match simulation (deterministic) ----------
 
-function simulateMatch(player) {
+function simulateMatch(player, boldness = 'standard') {
   const opponentPool = CLUBS.filter(c => c.id !== player.club);
   const isRivalRound = player.round % 6 === 0;
   const opponent = isRivalRound
@@ -478,15 +478,20 @@ function simulateMatch(player) {
 
   // Experience dampens variance and raises the ceiling — a debutant with
   // no games and modest stats should mostly post ordinary, forgettable
-  // performances, not 9s and 10s.
+  // performances, not 9s and 10s. Boldness (chosen before kickoff) scales
+  // that variance further — playing it bold widens the swing, cautious
+  // narrows it — the same risk/reward logic as a dice check, just applied
+  // to the whole game instead of one action.
   const experience = clamp(player.careerStats.matches / 30, 0, 1); // 0 debut -> 1 veteran (30+ games)
   const skill = (player.stats.power + player.stats.steel + player.stats.boot) / 3; // ~10-100
   const skillNorm = clamp((skill - 30) / 55, 0, 1);
   const formNorm = player.form / 100; // -1..1
-  const spread = 2.6 - experience * 1.3;
+  const boldFactor = boldness === 'bold' ? 1.35 : boldness === 'cautious' ? 0.7 : 1;
+  const boldMeanShift = boldness === 'bold' ? 1.2 : boldness === 'cautious' ? -0.4 : 0;
+  const spread = (2.6 - experience * 1.3) * boldFactor;
   const luck = (Math.random() + Math.random() - 1) * spread;
 
-  let rating = 4 + skillNorm * 2.6 + formNorm * 1.3 + experience * 0.6 + luck;
+  let rating = 4 + skillNorm * 2.6 + formNorm * 1.3 + experience * 0.6 + boldMeanShift + luck;
   rating = clamp(rating, 1, 10);
 
   const playerImpact = clamp((rating - 5.5) * 8, -22, 34);
@@ -517,6 +522,88 @@ function simulateMatch(player) {
   const injuryWeeks = injured ? (1 + Math.floor(Math.random() * 4)) : 0;
 
   return { opponent, ownScore, oppScore, won, margin, rating, moments, isRivalRound, injured, injuryWeeks };
+}
+
+// ---------- Match moments ----------
+// A pivotal in-game decision, offered on some matches (not all — every
+// match would be exhausting over an 18-round season). Resolved with the
+// exact same free-text -> classify -> dice-check machinery as an event,
+// except the outcome adjusts the score directly instead of a relationship
+// or stat. side:'own' means the delta lands on your team's score; side:'opp'
+// means it lands on the opponent's (a negative delta there is good for you
+// — fewer points against). Fail is always a wash (nothing you could've
+// done); only success tiers move the score, and only critFail carries a
+// real downside, same asymmetry as a real clutch moment.
+
+const CRUNCH_CHANCE = 0.45;
+
+const MATCH_MOMENTS = [
+  {
+    id: 'last_ditch_defense',
+    side: 'opp',
+    weight: () => 8,
+    primarySkills: ['steel', 'composure'],
+    baseDC: (base) => 10 + Math.round(base.opponent.tier * 0.6),
+    beat: (base) => `Last tackle of the set. ${base.opponent.name} are a metre out with the clock running down. It's on you to stop it.`,
+    suggestions: ['I go low and rip the ball out', 'I hold my ground and drive them back', 'I read the shift and jump the passing lane'],
+    outcomeTable: {
+      critSuccess: { scoreDelta: -6, ratingDelta: 1.5, hint: 'You strip it clean over the line — no try, and you come away with the ball.' },
+      success:     { scoreDelta: -4, ratingDelta: 0.8, hint: 'You hold them up short. No try this set.' },
+      fail:        { scoreDelta: 0,  ratingDelta: -0.3, hint: 'They force it over regardless. Nothing you could have done differently.' },
+      critFail:    { scoreDelta: 4,  ratingDelta: -1, hint: 'You miss it completely and they score wide, easier than it should have been.' }
+    }
+  },
+  {
+    id: 'match_winning_kick',
+    side: 'own',
+    weight: (base) => Math.abs(base.margin) <= 6 ? 12 : 0,
+    primarySkills: ['boot', 'composure'],
+    baseDC: () => 13,
+    beat: (base, player) => `The clock's read for one more play, ${clubName(player.club)} ${base.margin >= 0 ? `ahead by ${base.margin}` : `behind by ${Math.abs(base.margin)}`}. A shot at goal presents itself from halfway.`,
+    suggestions: ['I back myself and take the shot', 'I play it safe and run it for field position', 'I go for broke with a risky long-range attempt'],
+    outcomeTable: {
+      critSuccess: { scoreDelta: 6, ratingDelta: 1.2, hint: 'The kick sails through from way out. Nerveless.' },
+      success:     { scoreDelta: 2, ratingDelta: 0.5, hint: 'A straightforward shot, and you slot it.' },
+      fail:        { scoreDelta: 0, ratingDelta: -0.4, hint: 'It drifts wide at the death. A gettable one goes begging.' },
+      critFail:    { scoreDelta: 0, ratingDelta: -0.9, hint: 'You shank it well off target. The chance is gone, and it shows in your body language.' }
+    }
+  },
+  {
+    id: 'momentum_big_hit',
+    side: 'own',
+    weight: () => 6,
+    primarySkills: ['power', 'steel'],
+    baseDC: () => 12,
+    beat: () => `Twenty minutes in, the game's still finding its rhythm. You line up their biggest ball-runner in front of the whole crowd.`,
+    suggestions: ['I go in hard and put everything into the hit', 'I stay controlled and make a safe tackle', 'I try to strip the ball as I hit him'],
+    outcomeTable: {
+      critSuccess: { scoreDelta: 4, ratingDelta: 1, hint: 'The hit is bone-rattling. The whole ground feels the shift in momentum.' },
+      success:     { scoreDelta: 1, ratingDelta: 0.4, hint: 'A solid, textbook tackle. Nothing flashy, but it holds.' },
+      fail:        { scoreDelta: 0, ratingDelta: -0.2, hint: 'He shrugs through it. No real damage done either way.' },
+      critFail:    { scoreDelta: 0, ratingDelta: -0.7, hint: 'You miss it, and he offloads out the back for a linebreak.' }
+    }
+  },
+  {
+    id: 'rival_niggle',
+    side: 'opp',
+    weight: (base) => base.isRivalRound ? 10 : 0,
+    primarySkills: ['composure', 'power'],
+    baseDC: () => 13,
+    beat: () => `Their enforcer's been chirping in your ear all half, trying to get a reaction out of you in front of the derby crowd.`,
+    suggestions: ['I keep my composure and let my footy do the talking', 'I give it back to him just as hard', 'I completely ignore him'],
+    outcomeTable: {
+      critSuccess: { scoreDelta: -4, ratingDelta: 0.6, hint: 'You needle him back just enough that he loses his discipline completely.', extra: (p) => { p.reputation += 2; } },
+      success:     { scoreDelta: -2, ratingDelta: 0.3, hint: 'You let it go over your head. He wastes his energy on nothing.' },
+      fail:        { scoreDelta: 0, ratingDelta: -0.2, hint: `It gets under your skin more than you'd like, but nothing comes of it.` },
+      critFail:    { scoreDelta: 4, ratingDelta: -0.8, hint: 'You snap back at him and give away a needless penalty right in front of the posts.', extra: (p) => { p.reputation -= 3; p.relationships.media -= 4; } }
+    }
+  }
+];
+
+function eligibleMatchMoments(base, player) {
+  return MATCH_MOMENTS
+    .map(t => ({ t, weight: t.weight(base, player) }))
+    .filter(x => x.weight > 0);
 }
 
 // ---------- Player init ----------
@@ -658,13 +745,16 @@ Outcome (what actually happened, do not contradict this): ${resolved.hint}`;
 async function narrateMatch(p, result) {
   const system = `You are the commentary and recap writer for LAST TACKLE, a text rugby league career sim. You are given the final match facts already decided by the game engine — never invent a different score, scorer, or outcome. Respond with ONLY valid JSON, no markdown fences, no preamble, in exactly this shape:
 {"commentary": ["line 1", "line 2", "line 3"], "recap": "2-3 sentence recap"}
-Each commentary line is under 20 words, present tense, broadcast style, one per key moment given, in order. The recap is second person, understated, references how the player's moments shaped the result.`;
+Each commentary line is under 20 words, present tense, broadcast style, one per key moment given, in order. The recap is second person, understated, references how the player's moments shaped the result. If a pivotal moment is given, the recap should make clear that specific moment — and the player's own stated action in it — is what swung the result, not just a generic mention.`;
+  const pivotalLine = result.crunch
+    ? `\nPivotal moment — the player's own stated action: "${result.crunch.actionText}"\nThis was a ${ATTR_LABELS[result.crunch.skill]} check, played ${result.crunch.boldness}, result: ${result.crunch.tier === 'critSuccess' ? 'a clean, decisive success' : result.crunch.tier === 'success' ? 'a modest success' : result.crunch.tier === 'fail' ? 'no real change either way' : 'a costly failure'}. What happened: ${result.crunch.hint}`
+    : '';
   const user = `Player: ${JSON.stringify(playerSnapshotForPrompt(p))}
 Opponent: ${result.opponent.name}${result.isRivalRound ? ' (rivalry match)' : ''}
 Final score: ${clubName(p.club)} ${result.ownScore} — ${result.opponent.name} ${result.oppScore}
 Result: ${result.won ? 'win' : 'loss'}
 Player rating (1-10): ${result.rating.toFixed(1)}
-Key moments in order: ${result.moments.map(m => `minute ${m.minute}: ${m.tag}`).join('; ')}`;
+Key moments in order: ${result.moments.map(m => `minute ${m.minute}: ${m.tag}`).join('; ')}${pivotalLine}`;
   const raw = await callClaude(system, user, 400);
   try {
     const cleaned = raw.replace(/^```json\s*/i, '').replace(/```$/, '').trim();
@@ -871,18 +961,110 @@ async function submitFreeformAction(template, vars, actionText) {
 }
 
 async function runMatch() {
+  renderMatchApproachPrompt();
+}
+
+function renderMatchApproachPrompt() {
+  renderTopbar();
+  stage.innerHTML = `
+    <div class="week-tag">Match day · Season ${player.season}, Round ${player.round}</div>
+    <div class="event-title">How are you playing this one?</div>
+    <div class="narrative"><p>One tap, then kickoff.</p></div>
+    <div class="chip-row">
+      <button class="chip" data-bold="cautious">Cautious — play it tight</button>
+      <button class="chip" data-bold="standard">Balanced</button>
+      <button class="chip" data-bold="bold">All out — full risk</button>
+    </div>
+    ${renderLogHtml()}
+  `;
+  stage.querySelectorAll('[data-bold]').forEach(btn => {
+    btn.addEventListener('click', () => proceedToMatch(btn.dataset.bold));
+  });
+  renderSheet();
+  currentScreenRenderer = renderMatchApproachPrompt;
+  setActiveTab('overview', { skipRender: true });
+}
+
+async function proceedToMatch(boldness) {
   setBusy(true);
-  const result = simulateMatch(player);
+  const base = simulateMatch(player, boldness);
+  const eligible = eligibleMatchMoments(base, player);
+  const doCrunch = eligible.length > 0 && Math.random() < CRUNCH_CHANCE;
+  if (doCrunch) {
+    const template = weightedPick(eligible).t;
+    renderCrunchMoment(template, base);
+    setBusy(false);
+  } else {
+    await resolveMatch(base, null);
+    setBusy(false);
+  }
+}
+
+function renderCrunchMoment(template, base) {
+  renderTopbar();
+  const beatText = template.beat(base, player);
+  const chips = template.suggestions.map((s, i) => `<button class="chip" data-chip="${i}">${escapeHtml(s)}</button>`).join('');
+  stage.innerHTML = `
+    <div class="week-tag">Crunch moment · vs ${escapeHtml(base.opponent.name)}</div>
+    <div class="narrative"><p>${escapeHtml(beatText)}</p></div>
+    <p class="freeform-hint">This is the moment — what do you do?</p>
+    <div class="chip-row">${chips}</div>
+    <textarea class="freeform-box" id="crunchInput" rows="2" placeholder="What do you do?"></textarea>
+    <div class="continue-row"><button class="btn btn-primary" id="crunchSubmitBtn">Roll for it</button></div>
+  `;
+  const inputEl = document.getElementById('crunchInput');
+  stage.querySelectorAll('.chip').forEach(btn => {
+    btn.addEventListener('click', () => { inputEl.value = template.suggestions[parseInt(btn.dataset.chip, 10)]; inputEl.focus(); });
+  });
+  document.getElementById('crunchSubmitBtn').addEventListener('click', () => submitCrunchMoment(template, base, inputEl.value));
+  renderSheet();
+  currentScreenRenderer = () => renderCrunchMoment(template, base);
+  setActiveTab('overview', { skipRender: true });
+}
+
+async function submitCrunchMoment(template, base, actionText) {
+  if (uiBusy) return;
+  const text = actionText.trim();
+  if (text.length < 3) { toast('Type a bit more about what you do.'); return; }
+
+  setBusy(true);
+  const skill = classifySkill(text, template.primarySkills);
+  const boldness = classifyBoldness(text);
+  const dc = typeof template.baseDC === 'function' ? template.baseDC(base) : template.baseDC;
+  const roll = rollCheck(player.stats[skill], dc, boldness);
+  const tierData = template.outcomeTable[roll.degree];
+  if (tierData.extra) tierData.extra(player);
+
+  await renderDiceRollAnimation(skill, boldness, roll);
+
+  const crunch = {
+    skill, boldness, roll, tier: roll.degree,
+    scoreDelta: tierData.scoreDelta, ratingDelta: tierData.ratingDelta,
+    hint: tierData.hint, side: template.side, actionText: text
+  };
+  await resolveMatch(base, crunch);
+  setBusy(false);
+}
+
+async function resolveMatch(base, crunch) {
+  const result = Object.assign({}, base, { moments: base.moments.slice() });
+  if (crunch) {
+    if (crunch.side === 'own') result.ownScore = clamp(result.ownScore + crunch.scoreDelta, 0, 80);
+    else result.oppScore = clamp(result.oppScore + crunch.scoreDelta, 0, 80);
+    result.ownScore = Math.round(result.ownScore / 2) * 2;
+    result.oppScore = Math.round(result.oppScore / 2) * 2;
+    result.won = result.ownScore > result.oppScore;
+    result.margin = result.ownScore - result.oppScore;
+    result.rating = clamp(result.rating + crunch.ratingDelta, 1, 10);
+    result.crunch = crunch;
+  }
   renderLoading('Match day');
   try {
     const narration = await narrateMatch(player, result);
     finalizeMatch(result, narration);
   } catch (e) {
-    renderApiError(e, () => runMatch());
-    setBusy(false);
-    return;
+    renderApiError(e, () => resolveMatch(base, crunch));
   }
-  setBusy(false);
 }
 
 function finalizeMatch(result, narration) {
@@ -1122,8 +1304,16 @@ function renderMatchScreen(result, narration) {
   const momentsHtml = result.moments.map((m, i) => `
     <li class="moment"><span class="moment-min">${m.minute}'</span><span>${escapeHtml(narration.commentary[i] || m.tag)}</span></li>
   `).join('');
+  const crunchHtml = result.crunch ? `
+    <div class="action-echo">You: ${escapeHtml(result.crunch.actionText)}</div>
+    <div class="dice-strip">
+      <span class="tag ${TIER_CLASS[result.crunch.tier]}">${TIER_LABEL[result.crunch.tier]}</span>
+      <span class="dice-detail">${ATTR_LABELS[result.crunch.skill]} check · d20 (${result.crunch.roll.d20}) ${result.crunch.roll.mod >= 0 ? '+' : ''}${result.crunch.roll.mod} = ${result.crunch.roll.total} vs DC ${result.crunch.roll.dc}${result.crunch.boldness !== 'standard' ? ' · played ' + result.crunch.boldness : ''}</span>
+    </div>
+  ` : '';
   stage.innerHTML = `
     <div class="week-tag">${result.isRivalRound ? 'Rivalry match' : 'Match day'} · Season ${player.season}, Round ${player.round - 1}</div>
+    ${crunchHtml}
     <div class="scoreboard">
       <div class="scoreboard-teams">
         <span class="scoreboard-team">${escapeHtml(clubName(player.club))}</span>
